@@ -215,47 +215,92 @@ def sentinel_ndvi_kc_stats(aoi_geom, tree_geoms):
 
     img = col.median().clip(aoi_ee)
     ndvi = img.normalizedDifference(["B8", "B4"]).rename("NDVI")
-    kc = ndvi.subtract(0.2).divide(0.6).clamp(0.2, 1.05).rename("Kc")
 
-    site_stats = kc.addBands(ndvi).reduceRegion(
-        reducer=ee.Reducer.mean(),
-        geometry=aoi_ee,
-        scale=10,
-        maxPixels=1e10
-    ).getInfo() or {}
+    # Automatic NDVI zoning
+    tree_mask = ndvi.gte(0.5).rename("tree_mask")
+    grass_mask = ndvi.gte(0.3).And(ndvi.lt(0.5)).rename("grass_mask")
+    hard_mask = ndvi.lt(0.3).rename("hard_mask")
+
+    kc_auto = (
+        tree_mask.multiply(0.95)
+        .add(grass_mask.multiply(0.65))
+        .add(hard_mask.multiply(0.20))
+        .rename("Kc")
+    )
+
+    area_img = ee.Image.pixelArea().rename("px_area")
+
+    def zonal_stats(region_geom):
+        combined = ee.Image.cat([
+            area_img,
+            ndvi,
+            kc_auto,
+            tree_mask,
+            grass_mask,
+            hard_mask,
+            tree_mask.multiply(area_img).rename("tree_area_m2"),
+            grass_mask.multiply(area_img).rename("grass_area_m2"),
+            hard_mask.multiply(area_img).rename("hard_area_m2")
+        ])
+        stats = combined.reduceRegion(
+            reducer=ee.Reducer.mean(),
+            geometry=region_geom,
+            scale=10,
+            maxPixels=1e10
+        ).getInfo() or {}
+        sums = combined.select(["tree_area_m2", "grass_area_m2", "hard_area_m2"]).reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=region_geom,
+            scale=10,
+            maxPixels=1e10
+        ).getInfo() or {}
+        return stats, sums
+
+    site_stats, site_sums = zonal_stats(aoi_ee)
+    tree_area_auto = float(site_sums.get("tree_area_m2", 0.0))
+    grass_area_auto = float(site_sums.get("grass_area_m2", 0.0))
+    hard_area_auto = float(site_sums.get("hard_area_m2", 0.0))
+    total_auto = tree_area_auto + grass_area_auto + hard_area_auto
 
     results = {
         "site_kc": float(site_stats.get("Kc", 0.5)),
         "site_ndvi": float(site_stats.get("NDVI", 0.3)),
+        "tree_area_auto_m2": tree_area_auto,
+        "grass_area_auto_m2": grass_area_auto,
+        "hard_area_auto_m2": hard_area_auto,
+        "tree_frac_auto": (tree_area_auto / total_auto) if total_auto > 0 else 0.0,
+        "grass_frac_auto": (grass_area_auto / total_auto) if total_auto > 0 else 0.0,
+        "hard_frac_auto": (hard_area_auto / total_auto) if total_auto > 0 else 0.0,
+        "tree_kc_auto": 0.95,
+        "grass_kc_auto": 0.65,
+        "hard_kc_auto": 0.20,
     }
 
     if tree_geoms:
         tree_union = unary_union(tree_geoms)
         tree_ee = geometry_to_ee(tree_union)
-        tree_stats = kc.addBands(ndvi).reduceRegion(
-            reducer=ee.Reducer.mean(),
-            geometry=tree_ee,
-            scale=10,
-            maxPixels=1e10
-        ).getInfo() or {}
+        tree_stats, _ = zonal_stats(tree_ee)
 
         rem_geom = aoi_geom.difference(tree_union)
         if not rem_geom.is_empty:
             rem_ee = geometry_to_ee(rem_geom)
-            rem_stats = kc.addBands(ndvi).reduceRegion(
-                reducer=ee.Reducer.mean(),
-                geometry=rem_ee,
-                scale=10,
-                maxPixels=1e10
-            ).getInfo() or {}
+            rem_stats, rem_sums = zonal_stats(rem_ee)
         else:
-            rem_stats = {}
+            rem_stats, rem_sums = {}, {}
+
+        rem_tree_area = float(rem_sums.get("tree_area_m2", 0.0))
+        rem_grass_area = float(rem_sums.get("grass_area_m2", 0.0))
+        rem_hard_area = float(rem_sums.get("hard_area_m2", 0.0))
+        rem_total = rem_tree_area + rem_grass_area + rem_hard_area
 
         results.update({
-            "tree_kc": float(tree_stats.get("Kc", 0.9)),
+            "tree_kc": float(tree_stats.get("Kc", 0.95)),
             "tree_ndvi": float(tree_stats.get("NDVI", 0.6)),
             "rem_kc": float(rem_stats.get("Kc", results["site_kc"])),
             "rem_ndvi": float(rem_stats.get("NDVI", results["site_ndvi"])),
+            "rem_tree_frac_auto": (rem_tree_area / rem_total) if rem_total > 0 else 0.0,
+            "rem_grass_frac_auto": (rem_grass_area / rem_total) if rem_total > 0 else 0.0,
+            "rem_hard_frac_auto": (rem_hard_area / rem_total) if rem_total > 0 else 0.0,
         })
     else:
         results.update({
@@ -263,6 +308,9 @@ def sentinel_ndvi_kc_stats(aoi_geom, tree_geoms):
             "tree_ndvi": np.nan,
             "rem_kc": results["site_kc"],
             "rem_ndvi": results["site_ndvi"],
+            "rem_tree_frac_auto": results["tree_frac_auto"],
+            "rem_grass_frac_auto": results["grass_frac_auto"],
+            "rem_hard_frac_auto": results["hard_frac_auto"],
         })
 
     return results
@@ -277,7 +325,7 @@ with st.sidebar:
     clear = st.button("Clear polygons")
     run = st.button("Run model", type="primary")
     st.markdown("**Drawing rule**")
-    st.caption("First polygon = site AOI. Any additional polygons = tree zones.")
+    st.caption("First polygon = site AOI. Any additional polygons = manual tree override zones.")
 
 # -----------------------------
 # Session state
@@ -387,6 +435,18 @@ if run:
                     "tree_ndvi": 0.65 if tree_geoms else np.nan,
                     "rem_kc": 0.45,
                     "rem_ndvi": 0.25,
+                    "tree_area_auto_m2": 0.0,
+                    "grass_area_auto_m2": 0.0,
+                    "hard_area_auto_m2": aoi_area or 0.0,
+                    "tree_frac_auto": 0.0,
+                    "grass_frac_auto": 0.0,
+                    "hard_frac_auto": 1.0,
+                    "tree_kc_auto": 0.95,
+                    "grass_kc_auto": 0.65,
+                    "hard_kc_auto": 0.20,
+                    "rem_tree_frac_auto": 0.0,
+                    "rem_grass_frac_auto": 0.0,
+                    "rem_hard_frac_auto": 1.0,
                 }
 
         df["ET_site_mm_h"] = df["ET0_mm_h"] * stats["site_kc"]
@@ -423,12 +483,28 @@ if run:
             s2.metric("Mean site Kc", f"{stats['site_kc']:.3f}")
             s3.metric("Mean ET0", f"{df['ET0_mm_h'].mean():.3f} mm/h")
 
+            st.subheader("Automatic NDVI zoning")
+            z1, z2, z3 = st.columns(3)
+            z1.metric("Auto tree cover", f"{100 * stats['tree_frac_auto']:.1f}%")
+            z2.metric("Auto grass cover", f"{100 * stats['grass_frac_auto']:.1f}%")
+            z3.metric("Auto hard cover", f"{100 * stats['hard_frac_auto']:.1f}%")
+
+            za1, za2, za3 = st.columns(3)
+            za1.metric("Auto tree area", f"{stats['tree_area_auto_m2']:,.0f} m2")
+            za2.metric("Auto grass area", f"{stats['grass_area_auto_m2']:,.0f} m2")
+            za3.metric("Auto hard area", f"{stats['hard_area_auto_m2']:,.0f} m2")
+
             if tree_geoms:
+                st.subheader("Manual tree override zones")
                 t1, t2, t3, t4 = st.columns(4)
                 t1.metric("Tree NDVI", f"{stats['tree_ndvi']:.3f}")
                 t2.metric("Tree Kc", f"{stats['tree_kc']:.3f}")
                 t3.metric("Remainder NDVI", f"{stats['rem_ndvi']:.3f}")
                 t4.metric("Remainder Kc", f"{stats['rem_kc']:.3f}")
+                r1, r2, r3 = st.columns(3)
+                r1.metric("Remainder auto tree", f"{100 * stats['rem_tree_frac_auto']:.1f}%")
+                r2.metric("Remainder auto grass", f"{100 * stats['rem_grass_frac_auto']:.1f}%")
+                r3.metric("Remainder auto hard", f"{100 * stats['rem_hard_frac_auto']:.1f}%")
 
             st.subheader("Key totals")
             k1, k2, k3, k4 = st.columns(4)
@@ -443,8 +519,11 @@ if run:
                 "Total weighted ET volume (m3)": df["Total_Weighted_ET_m3_h"].sum(),
                 "Total weighted cooling (kWh)": df["Total_Weighted_Cooling_kWh_h"].sum(),
                 "Site area (m2)": aoi_area or 0.0,
-                "Tree area (m2)": tree_area,
+                "Manual tree area (m2)": tree_area,
                 "Remainder area (m2)": rem_area,
+                "Auto tree area from NDVI (m2)": stats["tree_area_auto_m2"],
+                "Auto grass area from NDVI (m2)": stats["grass_area_auto_m2"],
+                "Auto hard area from NDVI (m2)": stats["hard_area_auto_m2"],
             }
             if tree_geoms:
                 summary["Total tree ET depth (mm)"] = df["ET_tree_mm_h"].sum()
@@ -491,6 +570,7 @@ if run:
             export_cols = [c for c in export_cols if c in df.columns]
             csv_data = df[export_cols].to_csv(index=False).encode("utf-8")
             st.download_button("Download results CSV", data=csv_data, file_name="site_et_results.csv", mime="text/csv")
-            st.caption("Weighted ET volume uses polygon area. Cooling is estimated from latent heat of evaporation.")
+            st.caption("Weighted ET volume uses polygon area. Cooling is estimated from latent heat of evaporation. NDVI zoning is automatic by default; extra polygons act as manual tree overrides.")
+
 
 
