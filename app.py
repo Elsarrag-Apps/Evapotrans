@@ -74,8 +74,13 @@ def read_epw(uploaded_file):
     if df.shape[1] < 22:
         raise ValueError("The EPW data columns could not be read correctly.")
 
-    df = df.iloc[:, :35].copy()
-    df.columns = EPW_COLUMNS
+    # EPW exports can vary slightly in column count across sources.
+    # Keep the available columns, then pad any missing standard fields with NaN.
+    n_cols = min(df.shape[1], len(EPW_COLUMNS))
+    df = df.iloc[:, :n_cols].copy()
+    df.columns = EPW_COLUMNS[:n_cols]
+    for missing_col in EPW_COLUMNS[n_cols:]:
+        df[missing_col] = np.nan
     df["Hour"] = pd.to_numeric(df["Hour"], errors="coerce").fillna(1).astype(int) - 1
     for col in ["Year", "Month", "Day"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -87,6 +92,11 @@ def read_epw(uploaded_file):
         dict(year=df["Year"], month=df["Month"], day=df["Day"], hour=df["Hour"]),
         errors="coerce"
     )
+
+    required_cols = ["DryBulb", "RH", "Pressure", "GlobalHorizontalRadiation", "WindSpeed", "Hour", "Year", "Month", "Day"]
+    for req in required_cols:
+        if req not in df.columns:
+            raise ValueError(f"The EPW file is missing the required column: {req}")
 
     numeric_cols = ["DryBulb", "RH", "Pressure", "GlobalHorizontalRadiation", "WindSpeed"]
     for col in numeric_cols:
@@ -391,3 +401,4 @@ if run:
 
         csv_data = df[["timestamp"] + plot_cols].to_csv(index=False).encode("utf-8")
         st.download_button("Download results CSV", data=csv_data, file_name="site_et_results.csv", mime="text/csv")
+
