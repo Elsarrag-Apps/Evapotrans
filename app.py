@@ -20,6 +20,13 @@ from streamlit_folium import st_folium
 st.set_page_config(page_title="Site ET Tool", layout="wide")
 st.title("Site Evapotranspiration Tool")
 st.caption("Upload an EPW file, draw one site polygon, and optionally add tree polygons.")
+st.markdown("""
+### How to use
+1. Upload an EPW file
+2. Draw the main site polygon
+3. Optionally draw one or more tree polygons
+4. Click **Run model**
+""")
 
 # -----------------------------
 # Helpers
@@ -148,6 +155,17 @@ def area_m2(geom):
     geod = Geod(ellps="WGS84")
     area, _ = geod.geometry_area_perimeter(geom)
     return abs(float(area))
+
+
+def mm_over_area_to_m3(et_mm, area_m2_value):
+    return (et_mm / 1000.0) * area_m2_value
+
+
+def et_mm_to_cooling_kwh(et_mm, area_m2_value, latent_heat_mj_per_kg=2.45):
+    # 1 mm over 1 m2 = 1 kg water
+    mass_kg = et_mm * area_m2_value
+    energy_mj = mass_kg * latent_heat_mj_per_kg
+    return energy_mj / 3.6
 
 
 def geometry_to_ee(geom):
@@ -296,13 +314,19 @@ Draw(
     edit_options={"edit": True, "remove": True},
 ).add_to(m)
 
-map_data = st_folium(m, width=1100, height=650, key="site_et_map")
+# Reset drawings properly using session state
+if "draw_data" not in st.session_state:
+    st.session_state.draw_data = []
 
 if clear:
-    st.session_state["site_et_map"] = None
-    st.rerun()
+    st.session_state.draw_data = []
 
-all_drawings = map_data.get("all_drawings", []) if map_data else []
+map_data = st_folium(m, width=1100, height=650, key="site_et_map")
+
+if map_data and map_data.get("all_drawings") is not None:
+    st.session_state.draw_data = map_data.get("all_drawings", [])
+
+all_drawings = st.session_state.draw_data
 polygons = [shape(feat["geometry"]) for feat in all_drawings if feat.get("geometry", {}).get("type") == "Polygon"]
 aoi_geom = polygons[0] if len(polygons) >= 1 else None
 tree_geoms = polygons[1:] if len(polygons) >= 2 else []
@@ -315,9 +339,13 @@ if aoi_geom is not None and tree_geoms:
 # Geometry summary
 # -----------------------------
 col1, col2, col3 = st.columns(3)
+aoi_area = None
+tree_area = 0.0
+rem_area = 0.0
 if aoi_geom is not None:
     aoi_area = area_m2(aoi_geom)
     tree_area = sum(area_m2(g) for g in tree_geoms) if tree_geoms else 0.0
+    tree_area = min(tree_area, aoi_area)
     rem_area = max(0.0, aoi_area - tree_area)
     col1.metric("Site area", f"{aoi_area:,.0f} m2")
     col2.metric("Tree area", f"{tree_area:,.0f} m2")
@@ -365,40 +393,104 @@ if run:
         if tree_geoms:
             df["ET_tree_mm_h"] = df["ET0_mm_h"] * stats["tree_kc"]
             df["ET_rem_mm_h"] = df["ET0_mm_h"] * stats["rem_kc"]
+        else:
+            df["ET_tree_mm_h"] = np.nan
+            df["ET_rem_mm_h"] = df["ET_site_mm_h"]
 
-        st.subheader("Spatial coefficients")
-        s1, s2, s3 = st.columns(3)
-        s1.metric("Mean site NDVI", f"{stats['site_ndvi']:.3f}")
-        s2.metric("Mean site Kc", f"{stats['site_kc']:.3f}")
-        s3.metric("Mean ET0", f"{df['ET0_mm_h'].mean():.3f} mm/h")
-
+        df["Site_ET_m3_h"] = df["ET_site_mm_h"].apply(lambda x: mm_over_area_to_m3(x, aoi_area or 0.0))
+        df["Site_Cooling_kWh_h"] = df["ET_site_mm_h"].apply(lambda x: et_mm_to_cooling_kwh(x, aoi_area or 0.0))
         if tree_geoms:
-            t1, t2, t3, t4 = st.columns(4)
-            t1.metric("Tree NDVI", f"{stats['tree_ndvi']:.3f}")
-            t2.metric("Tree Kc", f"{stats['tree_kc']:.3f}")
-            t3.metric("Remainder NDVI", f"{stats['rem_ndvi']:.3f}")
-            t4.metric("Remainder Kc", f"{stats['rem_kc']:.3f}")
+            df["Tree_ET_m3_h"] = df["ET_tree_mm_h"].apply(lambda x: mm_over_area_to_m3(x, tree_area))
+            df["Tree_Cooling_kWh_h"] = df["ET_tree_mm_h"].apply(lambda x: et_mm_to_cooling_kwh(x, tree_area))
+            df["Rem_ET_m3_h"] = df["ET_rem_mm_h"].apply(lambda x: mm_over_area_to_m3(x, rem_area))
+            df["Rem_Cooling_kWh_h"] = df["ET_rem_mm_h"].apply(lambda x: et_mm_to_cooling_kwh(x, rem_area))
+            df["Total_Weighted_ET_m3_h"] = df["Tree_ET_m3_h"] + df["Rem_ET_m3_h"]
+            df["Total_Weighted_Cooling_kWh_h"] = df["Tree_Cooling_kWh_h"] + df["Rem_Cooling_kWh_h"]
+        else:
+            df["Tree_ET_m3_h"] = np.nan
+            df["Tree_Cooling_kWh_h"] = np.nan
+            df["Rem_ET_m3_h"] = df["Site_ET_m3_h"]
+            df["Rem_Cooling_kWh_h"] = df["Site_Cooling_kWh_h"]
+            df["Total_Weighted_ET_m3_h"] = df["Site_ET_m3_h"]
+            df["Total_Weighted_Cooling_kWh_h"] = df["Site_Cooling_kWh_h"]
 
-        st.subheader("Hourly results")
-        plot_cols = ["ET0_mm_h", "ET_site_mm_h"]
-        if tree_geoms:
-            plot_cols += ["ET_tree_mm_h", "ET_rem_mm_h"]
-        st.line_chart(df.set_index("timestamp")[plot_cols])
+        tab1, tab2, tab3, tab4 = st.tabs(["Summary", "Time Series", "Volumes & Cooling", "Download"])
 
-        daily = df.set_index("timestamp")[plot_cols].resample("D").sum()
-        st.subheader("Daily totals")
-        st.line_chart(daily)
+        with tab1:
+            st.subheader("Spatial coefficients")
+            s1, s2, s3 = st.columns(3)
+            s1.metric("Mean site NDVI", f"{stats['site_ndvi']:.3f}")
+            s2.metric("Mean site Kc", f"{stats['site_kc']:.3f}")
+            s3.metric("Mean ET0", f"{df['ET0_mm_h'].mean():.3f} mm/h")
 
-        st.subheader("Summary")
-        summary = {
-            "Total ET0 (mm)": df["ET0_mm_h"].sum(),
-            "Total site ET (mm)": df["ET_site_mm_h"].sum(),
-        }
-        if tree_geoms:
-            summary["Total tree ET (mm)"] = df["ET_tree_mm_h"].sum()
-            summary["Total remainder ET (mm)"] = df["ET_rem_mm_h"].sum()
-        st.dataframe(pd.DataFrame(summary.items(), columns=["Metric", "Value"]).style.format({"Value": "{:.2f}"}), use_container_width=True)
+            if tree_geoms:
+                t1, t2, t3, t4 = st.columns(4)
+                t1.metric("Tree NDVI", f"{stats['tree_ndvi']:.3f}")
+                t2.metric("Tree Kc", f"{stats['tree_kc']:.3f}")
+                t3.metric("Remainder NDVI", f"{stats['rem_ndvi']:.3f}")
+                t4.metric("Remainder Kc", f"{stats['rem_kc']:.3f}")
 
-        csv_data = df[["timestamp"] + plot_cols].to_csv(index=False).encode("utf-8")
-        st.download_button("Download results CSV", data=csv_data, file_name="site_et_results.csv", mime="text/csv")
+            st.subheader("Key totals")
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Annual site ET", f"{df['ET_site_mm_h'].sum():,.1f} mm")
+            k2.metric("Annual weighted ET", f"{df['Total_Weighted_ET_m3_h'].sum():,.0f} m3")
+            k3.metric("Annual cooling", f"{df['Total_Weighted_Cooling_kWh_h'].sum():,.0f} kWh")
+            k4.metric("Peak hourly cooling", f"{df['Total_Weighted_Cooling_kWh_h'].max():,.1f} kWh/h")
+
+            summary = {
+                "Total ET0 (mm)": df["ET0_mm_h"].sum(),
+                "Total site ET depth (mm)": df["ET_site_mm_h"].sum(),
+                "Total weighted ET volume (m3)": df["Total_Weighted_ET_m3_h"].sum(),
+                "Total weighted cooling (kWh)": df["Total_Weighted_Cooling_kWh_h"].sum(),
+                "Site area (m2)": aoi_area or 0.0,
+                "Tree area (m2)": tree_area,
+                "Remainder area (m2)": rem_area,
+            }
+            if tree_geoms:
+                summary["Total tree ET depth (mm)"] = df["ET_tree_mm_h"].sum()
+                summary["Total remainder ET depth (mm)"] = df["ET_rem_mm_h"].sum()
+                summary["Tree ET volume (m3)"] = df["Tree_ET_m3_h"].sum()
+                summary["Remainder ET volume (m3)"] = df["Rem_ET_m3_h"].sum()
+                summary["Tree cooling (kWh)"] = df["Tree_Cooling_kWh_h"].sum()
+                summary["Remainder cooling (kWh)"] = df["Rem_Cooling_kWh_h"].sum()
+            st.dataframe(pd.DataFrame(summary.items(), columns=["Metric", "Value"]).style.format({"Value": "{:.2f}"}), use_container_width=True)
+
+        with tab2:
+            st.subheader("Hourly ET")
+            plot_cols = ["ET0_mm_h", "ET_site_mm_h"]
+            if tree_geoms:
+                plot_cols += ["ET_tree_mm_h", "ET_rem_mm_h"]
+            st.line_chart(df.set_index("timestamp")[plot_cols])
+
+            daily = df.set_index("timestamp")[plot_cols].resample("D").sum()
+            st.subheader("Daily ET totals")
+            st.line_chart(daily)
+
+            monthly = df.set_index("timestamp")[plot_cols].resample("ME").sum()
+            st.subheader("Monthly ET totals")
+            st.line_chart(monthly)
+
+        with tab3:
+            vol_cols = ["Site_ET_m3_h", "Total_Weighted_ET_m3_h", "Site_Cooling_kWh_h", "Total_Weighted_Cooling_kWh_h"]
+            if tree_geoms:
+                vol_cols += ["Tree_ET_m3_h", "Rem_ET_m3_h", "Tree_Cooling_kWh_h", "Rem_Cooling_kWh_h"]
+
+            st.subheader("Hourly water volume and cooling")
+            st.line_chart(df.set_index("timestamp")[vol_cols])
+
+            daily_vol = df.set_index("timestamp")[vol_cols].resample("D").sum()
+            st.subheader("Daily water volume and cooling")
+            st.line_chart(daily_vol)
+
+        with tab4:
+            export_cols = [
+                "timestamp", "ET0_mm_h", "ET_site_mm_h", "ET_tree_mm_h", "ET_rem_mm_h",
+                "Site_ET_m3_h", "Tree_ET_m3_h", "Rem_ET_m3_h", "Total_Weighted_ET_m3_h",
+                "Site_Cooling_kWh_h", "Tree_Cooling_kWh_h", "Rem_Cooling_kWh_h", "Total_Weighted_Cooling_kWh_h"
+            ]
+            export_cols = [c for c in export_cols if c in df.columns]
+            csv_data = df[export_cols].to_csv(index=False).encode("utf-8")
+            st.download_button("Download results CSV", data=csv_data, file_name="site_et_results.csv", mime="text/csv")
+            st.caption("Weighted ET volume uses polygon area. Cooling is estimated from latent heat of evaporation.")
+
 
