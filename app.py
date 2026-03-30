@@ -178,6 +178,51 @@ def init_ee():
     if st.session_state.get("ee_initialized"):
         return True
 
+    # Try service account (Streamlit Cloud)
+    try:
+        credentials = ee.ServiceAccountCredentials(
+            st.secrets["EE_CLIENT_EMAIL"],
+            key_data=st.secrets["EE_PRIVATE_KEY"],
+        )
+        ee.Initialize(credentials=credentials, project=st.secrets["EE_PROJECT"])
+        st.session_state["ee_initialized"] = True
+        return True
+    except Exception as e:
+        st.warning(f"EE service account init failed: {e}")
+
+    # Fallback to default (local auth)
+    try:
+        ee.Initialize()
+        st.session_state["ee_initialized"] = True
+        return True
+    except Exception as e:
+        st.warning(f"EE local init failed: {e}")
+        return False
+    if st.session_state.get("ee_initialized"):
+        return True
+
+    # Try service account (Streamlit Cloud)
+    try:
+        credentials = ee.ServiceAccountCredentials(
+            st.secrets["EE_CLIENT_EMAIL"],
+            key_data=st.secrets["EE_PRIVATE_KEY"],
+        )
+        ee.Initialize(credentials=credentials, project=st.secrets["EE_PROJECT"])
+        st.session_state["ee_initialized"] = True
+        return True
+    except Exception:
+        pass
+
+    # Fallback to default (local auth)
+    try:
+        ee.Initialize()
+        st.session_state["ee_initialized"] = True
+        return True
+    except Exception:
+        return False
+    if st.session_state.get("ee_initialized"):
+        return True
+
     project = None
     try:
         project = st.secrets["EE_PROJECT"]
@@ -349,6 +394,32 @@ if epw_file is not None:
 # Map
 # -----------------------------
 m = folium.Map(location=st.session_state.center, zoom_start=st.session_state.zoom, control_scale=True)
+
+# Add Earth Engine NDVI layer if available
+try:
+    if init_ee():
+        aoi_point = ee.Geometry.Point(st.session_state.center[::-1])
+        s2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+              .filterBounds(aoi_point)
+              .filterDate("2024-04-01", "2024-09-30")
+              .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
+              .median())
+        ndvi_img = s2.normalizedDifference(["B8", "B4"])
+
+        vis = {"min": 0, "max": 0.8, "palette": ["white", "yellow", "green"]}
+        map_id = ndvi_img.getMapId(vis)
+
+        folium.TileLayer(
+            tiles=map_id['tile_fetcher'].url_format,
+            attr="GEE NDVI",
+            name="NDVI",
+            overlay=True,
+            control=True
+        ).add_to(m)
+except Exception:
+    pass
+
+folium.LayerControl().add_to(m)
 Draw(
     export=False,
     draw_options={
@@ -571,6 +642,3 @@ if run:
             csv_data = df[export_cols].to_csv(index=False).encode("utf-8")
             st.download_button("Download results CSV", data=csv_data, file_name="site_et_results.csv", mime="text/csv")
             st.caption("Weighted ET volume uses polygon area. Cooling is estimated from latent heat of evaporation. NDVI zoning is automatic by default; extra polygons act as manual tree overrides.")
-
-
-
