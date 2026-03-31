@@ -663,42 +663,50 @@ if results is not None:
         # Mass balance check (ET consistency)
         # -----------------------------
         st.subheader("ET consistency check")
-        # Compute component sum (depth-based)
-        comp_cols = ["ET_rem_mm_h"]
-        if tree_area > 0:
-            comp_cols.append("ET_tree_mm_h")
-        if grass_area > 0:
-            comp_cols.append("ET_grass_mm_h")
-        if water_area > 0:
-            comp_cols.append("ET_water_mm_h")
-        if hard_area > 0:
-            comp_cols.append("ET_hard_mm_h")
 
-        comp_sum = df[comp_cols].fillna(0).sum(axis=1)
-        site_series = df["ET_site_mm_h"]
+        # Correct: use volume-based aggregation (area-weighted)
+        total_volume = df["Total_Weighted_ET_m3_h"].sum()
+        comp_total = (total_volume / aoi_area) * 1000 if aoi_area else 0.0  # convert to mm
 
-        # Compare annual totals
-        site_total = site_series.sum()
-        comp_total = comp_sum.sum()
+        site_total = df["ET_site_mm_h"].sum()
         diff = comp_total - site_total
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Site ET (total)", f"{site_total:,.1f} mm")
-        c2.metric("Sum of components", f"{comp_total:,.1f} mm")
+        c2.metric("Components (area-weighted)", f"{comp_total:,.1f} mm")
         c3.metric("Difference", f"{diff:,.2f} mm")
 
-        st.caption("Check: ET_site ≈ sum of ET_rem + ET_tree + ET_grass + ET_water + ET_hard. Small differences can occur due to averaging vs zoning.")
+        st.caption("Check uses area-weighted ET (via volume). ET_site is an averaged estimate; components are zone-based. Small differences are expected.")
+
+        # Baseline vs actual latent cooling comparison
+        baseline_cooling_series = df["ET0_mm_h"].apply(lambda x: et_mm_to_cooling_kwh(x, aoi_area or 0.0))
+        baseline_cooling_total = baseline_cooling_series.sum()
+        actual_cooling_total = df["Total_Weighted_Cooling_kWh_h"].sum()
+        cooling_difference = actual_cooling_total - baseline_cooling_total
+        cooling_percent = (cooling_difference / baseline_cooling_total * 100.0) if baseline_cooling_total != 0 else np.nan
+
+        st.subheader("Baseline vs actual latent cooling")
+        b1, b2, b3, b4 = st.columns(4)
+        b1.metric("Baseline latent cooling", f"{baseline_cooling_total:,.0f} kWh")
+        b2.metric("Actual latent cooling", f"{actual_cooling_total:,.0f} kWh")
+        b3.metric("Difference", f"{cooling_difference:,.0f} kWh")
+        b4.metric("Change vs baseline", f"{cooling_percent:,.1f}%" if pd.notna(cooling_percent) else "-")
+
+        st.caption("Baseline latent cooling is the reference ET0 cooling equivalent over the full site area. Actual latent cooling is the zone-weighted site result.")
+
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Annual site ET", f"{df['ET_site_mm_h'].sum():,.1f} mm")
         k2.metric("Annual weighted ET", f"{df['Total_Weighted_ET_m3_h'].sum():,.0f} m3")
-        k3.metric("Annual latent cooling equivalent", f"{df['Total_Weighted_Cooling_kWh_h'].sum():,.0f} kWh")
+        k3.metric("Annual actual latent cooling", f"{actual_cooling_total:,.0f} kWh")
         k4.metric("Peak hourly latent cooling", f"{df['Total_Weighted_Cooling_kWh_h'].max():,.1f} kWh/h")
 
         summary = {
             "Total ET0 (mm)": df["ET0_mm_h"].sum(),
             "Total site ET depth (mm)": df["ET_site_mm_h"].sum(),
             "Total weighted ET volume (m3)": df["Total_Weighted_ET_m3_h"].sum(),
-            "Total weighted latent cooling equivalent (kWh)": df["Total_Weighted_Cooling_kWh_h"].sum(),
+            "Baseline latent cooling equivalent (kWh)": baseline_cooling_total,
+            "Actual latent cooling equivalent (kWh)": actual_cooling_total,
+            "Latent cooling difference vs base
             "Site area (m2)": aoi_area or 0.0,
             "Manual tree area (m2)": tree_area,
             "Remainder area (m2)": rem_area,
