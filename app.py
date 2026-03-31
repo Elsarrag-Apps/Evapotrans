@@ -438,7 +438,7 @@ if clear:
     st.session_state.map_key_suffix += 1
     st.rerun()
 
-map_data = st_folium(m, width=1100, height=650, key=f"site_et_map_{st.session_state.map_key_s
+map_data = st_folium(m, width=1100, height=650, key="site_et_map_" + str(st.session_state.map_key_suffix))
 
 if map_data and map_data.get("all_drawings") is not None:
     st.session_state.draw_data = map_data.get("all_drawings", [])
@@ -459,7 +459,8 @@ if extra_polygons:
     with st.expander("Polygon type assignments", expanded=True):
         st.caption("Polygon 1 is always the site boundary. Assign each additional polygon to a zone type below.")
         for idx, geom in enumerate(extra_polygons):
-            area_label = f"{area_m2(geom.intersection(aoi_geom)) if aoi_geom is not None else area_m2(geom):,.0f} m2"
+            area_val = area_m2(geom.intersection(aoi_geom)) if aoi_geom is not None else area_m2(geom)
+            area_label = "{:.0f} m2".format(area_val)
             st.session_state.polygon_zone_types[idx] = st.selectbox(
                 f"Polygon {idx + 2} type ({area_label})",
                 ZONE_OPTIONS,
