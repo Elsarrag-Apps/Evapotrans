@@ -396,6 +396,7 @@ with st.sidebar:
             lon = float(selected_result["lon"])
             st.session_state.center = [lat, lon]
             st.session_state.zoom = 18
+            st.session_state.map_center_source = "search"
             st.session_state.map_key_suffix += 1
             st.rerun()
         elif search_query:
@@ -424,14 +425,19 @@ if "polygon_zone_types" not in st.session_state:
     st.session_state.polygon_zone_types = {}
 if "map_key_suffix" not in st.session_state:
     st.session_state.map_key_suffix = 0
+if "map_center_source" not in st.session_state:
+    st.session_state.map_center_source = "default"
 
 meta = None
 df_weather = None
 if epw_file is not None:
     try:
         meta, df_weather = read_epw(epw_file)
-        st.session_state.center = [meta["latitude"], meta["longitude"]]
-        st.session_state.zoom = 15
+        # Only center on EPW location unless the user has actively searched for a site
+        if st.session_state.map_center_source != "search":
+            st.session_state.center = [meta["latitude"], meta["longitude"]]
+            st.session_state.zoom = 15
+            st.session_state.map_center_source = "epw"
     except Exception as e:
         st.error(f"Could not read the EPW file: {e}")
 
