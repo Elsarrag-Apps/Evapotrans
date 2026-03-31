@@ -706,7 +706,8 @@ if results is not None:
             "Total weighted ET volume (m3)": df["Total_Weighted_ET_m3_h"].sum(),
             "Baseline latent cooling equivalent (kWh)": baseline_cooling_total,
             "Actual latent cooling equivalent (kWh)": actual_cooling_total,
-            "Latent cooling difference vs base
+            "Latent cooling difference vs baseline (kWh)": cooling_difference,
+            "Latent cooling change vs baseline (%)": cooling_percent,
             "Site area (m2)": aoi_area or 0.0,
             "Manual tree area (m2)": tree_area,
             "Remainder area (m2)": rem_area,
