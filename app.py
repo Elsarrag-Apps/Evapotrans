@@ -373,6 +373,8 @@ if "ee_init_error" not in st.session_state:
     st.session_state.ee_init_error = None
 if "polygon_zone_types" not in st.session_state:
     st.session_state.polygon_zone_types = {}
+if "map_key_suffix" not in st.session_state:
+    st.session_state.map_key_suffix = 0
 
 meta = None
 df_weather = None
@@ -432,9 +434,11 @@ Draw(
 if clear:
     st.session_state.draw_data = []
     st.session_state.results = None
+    st.session_state.polygon_zone_types = {}
+    st.session_state.map_key_suffix += 1
     st.rerun()
 
-map_data = st_folium(m, width=1100, height=650, key="site_et_map")
+map_data = st_folium(m, width=1100, height=650, key=f"site_et_map_{st.session_state.map_key_s
 
 if map_data and map_data.get("all_drawings") is not None:
     st.session_state.draw_data = map_data.get("all_drawings", [])
