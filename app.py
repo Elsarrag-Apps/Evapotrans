@@ -408,7 +408,8 @@ try:
             attr="GEE NDVI",
             name="NDVI",
             overlay=True,
-            control=True
+            control=True,
+            show=False
         ).add_to(m)
 except Exception:
     pass
