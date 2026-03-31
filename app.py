@@ -610,15 +610,13 @@ if run:
         ee_warning = None
         with st.spinner("Fetching NDVI and Kc from Earth Engine..."):
             try:
-                stats = sentinel_ndvi_kc_stats(aoi_geom, override_geom=override_geom)
+                stats_existing = sentinel_ndvi_kc_stats(aoi_geom, override_geom=None)
+                stats_scenario = sentinel_ndvi_kc_stats(aoi_geom, override_geom=override_geom)
             except Exception as e:
                 ee_warning = f"Earth Engine step did not run: {e}"
-                stats = {
-                    "site_kc": 0.6,
-                    "site_ndvi": 0.35,
-                    
-                    "rem_kc": 0.45,
-                    "rem_ndvi": 0.25,
+                stats_existing = {
+                    "site_kc": 0.45,
+                    "site_ndvi": 0.25,
                     "tree_area_auto_m2": 0.0,
                     "grass_area_auto_m2": 0.0,
                     "hard_area_auto_m2": aoi_area or 0.0,
@@ -628,20 +626,23 @@ if run:
                     "tree_kc_auto": 0.95,
                     "grass_kc_auto": 0.65,
                     "hard_kc_auto": 0.20,
+                    "rem_kc": 0.45,
+                    "rem_ndvi": 0.25,
                     "rem_tree_frac_auto": 0.0,
                     "rem_grass_frac_auto": 0.0,
                     "rem_hard_frac_auto": 1.0,
                 }
+                stats_scenario = dict(stats_existing)
 
-        df["ET_site_mm_h"] = df["ET0_mm_h"] * stats["site_kc"]
+        df["ET_existing_mm_h"] = df["ET0_mm_h"] * stats_existing["site_kc"]
         df["ET_tree_mm_h"] = df["ET0_mm_h"] * ZONE_KC["Trees"] if tree_area > 0 else np.nan
         df["ET_grass_mm_h"] = df["ET0_mm_h"] * ZONE_KC["Grass / planting"] if grass_area > 0 else np.nan
         df["ET_water_mm_h"] = df["ET0_mm_h"] * ZONE_KC["Water"] if water_area > 0 else np.nan
         df["ET_hard_mm_h"] = df["ET0_mm_h"] * ZONE_KC["Hardscape"] if hard_area > 0 else np.nan
-        df["ET_rem_mm_h"] = df["ET0_mm_h"] * stats["rem_kc"]
+        df["ET_rem_mm_h"] = df["ET0_mm_h"] * stats_scenario["rem_kc"]
 
-        df["Site_ET_m3_h"] = df["ET_site_mm_h"].apply(lambda x: mm_over_area_to_m3(x, aoi_area or 0.0))
-        df["Site_Cooling_kWh_h"] = df["ET_site_mm_h"].apply(lambda x: et_mm_to_cooling_kwh(x, aoi_area or 0.0))
+        df["Existing_ET_m3_h"] = df["ET_existing_mm_h"].apply(lambda x: mm_over_area_to_m3(x, aoi_area or 0.0))
+        df["Existing_Cooling_kWh_h"] = df["ET_existing_mm_h"].apply(lambda x: et_mm_to_cooling_kwh(x, aoi_area or 0.0))
         df["Tree_ET_m3_h"] = df["ET_tree_mm_h"].apply(lambda x: mm_over_area_to_m3(x, tree_area)) if tree_area > 0 else np.nan
         df["Tree_Cooling_kWh_h"] = df["ET_tree_mm_h"].apply(lambda x: et_mm_to_cooling_kwh(x, tree_area)) if tree_area > 0 else np.nan
         df["Grass_ET_m3_h"] = df["ET_grass_mm_h"].apply(lambda x: mm_over_area_to_m3(x, grass_area)) if grass_area > 0 else np.nan
@@ -662,10 +663,13 @@ if run:
                 total_cooling_parts.append(c)
         df["Total_Weighted_ET_m3_h"] = df[total_parts].fillna(0).sum(axis=1)
         df["Total_Weighted_Cooling_kWh_h"] = df[total_cooling_parts].fillna(0).sum(axis=1)
+        df["ET_scenario_mm_h"] = df["Total_Weighted_ET_m3_h"].apply(lambda x: (x / (aoi_area or 1.0)) * 1000.0)
+        df["Scenario_Cooling_kWh_h"] = df["Total_Weighted_Cooling_kWh_h"]
 
         st.session_state.results = {
             "df": df,
-            "stats": stats,
+            "stats_existing": stats_existing,
+            "stats_scenario": stats_scenario,
             "aoi_area": aoi_area,
             "tree_area": tree_area,
             "grass_area": grass_area,
@@ -681,7 +685,8 @@ if results is not None and isinstance(results.get("df"), pd.DataFrame):
     results["df"] = results["df"].sort_values("timestamp").reset_index(drop=True)
 if results is not None:
     df = results["df"]
-    stats = results["stats"]
+    stats_existing = results["stats_existing"]
+    stats_scenario = results["stats_scenario"]
     aoi_area = results["aoi_area"]
     tree_area = results["tree_area"]
     grass_area = results["grass_area"]
@@ -701,20 +706,20 @@ if results is not None:
     with tab1:
         st.subheader("Spatial coefficients")
         s1, s2, s3 = st.columns(3)
-        s1.metric("Mean site NDVI", f"{stats['site_ndvi']:.3f}")
-        s2.metric("Mean site Kc", f"{stats['site_kc']:.3f}")
+        s1.metric("Existing site NDVI", f"{stats_existing['site_ndvi']:.3f}")
+        s2.metric("Existing site Kc", f"{stats_existing['site_kc']:.3f}")
         s3.metric("Mean ET0", f"{df['ET0_mm_h'].mean():.3f} mm/h")
 
         st.subheader("Automatic NDVI zoning")
         z1, z2, z3 = st.columns(3)
-        z1.metric("Auto tree cover", f"{100 * stats['tree_frac_auto']:.1f}%")
-        z2.metric("Auto grass cover", f"{100 * stats['grass_frac_auto']:.1f}%")
-        z3.metric("Auto hard cover", f"{100 * stats['hard_frac_auto']:.1f}%")
+        z1.metric("Existing auto tree cover", f"{100 * stats_existing['tree_frac_auto']:.1f}%")
+        z2.metric("Existing auto grass cover", f"{100 * stats_existing['grass_frac_auto']:.1f}%")
+        z3.metric("Existing auto hard cover", f"{100 * stats_existing['hard_frac_auto']:.1f}%")
 
         za1, za2, za3 = st.columns(3)
-        za1.metric("Auto tree area", f"{stats['tree_area_auto_m2']:,.0f} m2")
-        za2.metric("Auto grass area", f"{stats['grass_area_auto_m2']:,.0f} m2")
-        za3.metric("Auto hard area", f"{stats['hard_area_auto_m2']:,.0f} m2")
+        za1.metric("Existing auto tree area", f"{stats_existing['tree_area_auto_m2']:,.0f} m2")
+        za2.metric("Existing auto grass area", f"{stats_existing['grass_area_auto_m2']:,.0f} m2")
+        za3.metric("Existing auto hard area", f"{stats_existing['hard_area_auto_m2']:,.0f} m2")
 
         if override_present:
             st.subheader("Manual override zones")
@@ -724,9 +729,9 @@ if results is not None:
             m3.metric("Water", f"{water_area:,.0f} m2")
             m4.metric("Hardscape", f"{hard_area:,.0f} m2")
             r1, r2, r3 = st.columns(3)
-            r1.metric("Remainder auto tree", f"{100 * stats['rem_tree_frac_auto']:.1f}%")
-            r2.metric("Remainder auto grass", f"{100 * stats['rem_grass_frac_auto']:.1f}%")
-            r3.metric("Remainder auto hard", f"{100 * stats['rem_hard_frac_auto']:.1f}%")
+            r1.metric("Remainder auto tree", f"{100 * stats_scenario['rem_tree_frac_auto']:.1f}%")
+            r2.metric("Remainder auto grass", f"{100 * stats_scenario['rem_grass_frac_auto']:.1f}%")
+            r3.metric("Remainder auto hard", f"{100 * stats_scenario['rem_hard_frac_auto']:.1f}%")
 
         st.subheader("Key totals")
 
@@ -739,7 +744,7 @@ if results is not None:
         total_volume = df["Total_Weighted_ET_m3_h"].sum()
         comp_total = (total_volume / aoi_area) * 1000 if aoi_area else 0.0  # convert to mm
 
-        site_total = df["ET_site_mm_h"].sum()
+        site_total = df["ET_scenario_mm_h"].sum()
         diff = comp_total - site_total
 
         c1, c2, c3 = st.columns(3)
@@ -747,44 +752,45 @@ if results is not None:
         c2.metric("Components (area-weighted)", f"{comp_total:,.1f} mm")
         c3.metric("Difference", f"{diff:,.2f} mm")
 
-        st.caption("Check uses area-weighted ET (via volume). ET_site is an averaged estimate; components are zone-based. Small differences are expected.")
+        st.caption("Check uses area-weighted ET (via volume). Scenario ET is derived directly from the zone-based breakdown, so differences should be near zero apart from rounding.")
 
         # Baseline vs actual latent cooling comparison
-        baseline_cooling_series = df["ET0_mm_h"].apply(lambda x: et_mm_to_cooling_kwh(x, aoi_area or 0.0))
+        baseline_cooling_series = df["Existing_Cooling_kWh_h"]
         baseline_cooling_total = baseline_cooling_series.sum()
-        actual_cooling_total = df["Total_Weighted_Cooling_kWh_h"].sum()
+        actual_cooling_total = df["Scenario_Cooling_kWh_h"].sum()
         cooling_difference = actual_cooling_total - baseline_cooling_total
         cooling_percent = (cooling_difference / baseline_cooling_total * 100.0) if baseline_cooling_total != 0 else np.nan
 
-        st.subheader("Baseline vs actual latent cooling")
+        st.subheader("Existing baseline vs scenario latent cooling")
         b1, b2, b3, b4 = st.columns(4)
-        b1.metric("Baseline latent cooling", f"{baseline_cooling_total:,.0f} kWh")
-        b2.metric("Actual latent cooling", f"{actual_cooling_total:,.0f} kWh")
+        b1.metric("Existing baseline latent cooling", f"{baseline_cooling_total:,.0f} kWh")
+        b2.metric("Scenario latent cooling", f"{actual_cooling_total:,.0f} kWh")
         b3.metric("Difference", f"{cooling_difference:,.0f} kWh")
         b4.metric("Change vs baseline", f"{cooling_percent:,.1f}%" if pd.notna(cooling_percent) else "-")
 
-        st.caption("Baseline latent cooling is the reference ET0 cooling equivalent over the full site area. Actual latent cooling is the zone-weighted site result.")
+        st.caption("Existing baseline latent cooling is the NDVI-only result over the full AOI with no manual overrides. Scenario latent cooling is the zone-weighted result after applying the manual override polygons.")
 
         k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Annual site ET", f"{df['ET_site_mm_h'].sum():,.1f} mm")
-        k2.metric("Annual weighted ET", f"{df['Total_Weighted_ET_m3_h'].sum():,.0f} m3")
-        k3.metric("Annual actual latent cooling", f"{actual_cooling_total:,.0f} kWh")
+        k1.metric("Existing baseline ET", f"{df['ET_existing_mm_h'].sum():,.1f} mm")
+        k2.metric("Scenario ET volume", f"{df['Total_Weighted_ET_m3_h'].sum():,.0f} m3")
+        k3.metric("Annual scenario latent cooling", f"{actual_cooling_total:,.0f} kWh")
         k4.metric("Peak hourly latent cooling", f"{df['Total_Weighted_Cooling_kWh_h'].max():,.1f} kWh/h")
 
         summary = {
             "Total ET0 (mm)": df["ET0_mm_h"].sum(),
-            "Total site ET depth (mm)": df["ET_site_mm_h"].sum(),
+            "Existing baseline ET depth (mm)": df["ET_existing_mm_h"].sum(),
+            "Scenario ET depth (mm)": df["ET_scenario_mm_h"].sum(),
             "Total weighted ET volume (m3)": df["Total_Weighted_ET_m3_h"].sum(),
-            "Baseline latent cooling equivalent (kWh)": baseline_cooling_total,
-            "Actual latent cooling equivalent (kWh)": actual_cooling_total,
+            "Existing baseline latent cooling equivalent (kWh)": baseline_cooling_total,
+            "Scenario latent cooling equivalent (kWh)": actual_cooling_total,
             "Latent cooling difference vs baseline (kWh)": cooling_difference,
             "Latent cooling change vs baseline (%)": cooling_percent,
             "Site area (m2)": aoi_area or 0.0,
             "Manual tree area (m2)": tree_area,
             "Remainder area (m2)": rem_area,
-            "Auto tree area from NDVI (m2)": stats["tree_area_auto_m2"],
-            "Auto grass area from NDVI (m2)": stats["grass_area_auto_m2"],
-            "Auto hard area from NDVI (m2)": stats["hard_area_auto_m2"],
+            "Existing auto tree area from NDVI (m2)": stats_existing["tree_area_auto_m2"],
+            "Existing auto grass area from NDVI (m2)": stats_existing["grass_area_auto_m2"],
+            "Existing auto hard area from NDVI (m2)": stats_existing["hard_area_auto_m2"],
         }
         summary["Total remainder ET depth (mm)"] = df["ET_rem_mm_h"].sum()
         summary["Remainder ET volume (m3)"] = df["Rem_ET_m3_h"].sum()
@@ -804,7 +810,7 @@ if results is not None:
         st.dataframe(pd.DataFrame(summary.items(), columns=["Metric", "Value"]).style.format({"Value": "{:.2f}"}), use_container_width=True)
 
     with tab2:
-        ref_site_cols = ["ET0_mm_h", "ET_site_mm_h"]
+        ref_site_cols = ["ET0_mm_h", "ET_existing_mm_h", "ET_scenario_mm_h"]
         zone_cols = ["ET_rem_mm_h"]
         if tree_area > 0:
             zone_cols.append("ET_tree_mm_h")
@@ -815,14 +821,14 @@ if results is not None:
         if hard_area > 0:
             zone_cols.append("ET_hard_mm_h")
 
-        st.subheader("Hourly ET: Reference vs Site")
+        st.subheader("Hourly ET: Reference, existing baseline, and scenario")
         st.line_chart(df.set_index("timestamp")[ref_site_cols])
 
         st.subheader("Hourly ET: Site breakdown")
         st.line_chart(df.set_index("timestamp")[zone_cols])
 
         daily_ref_site = df.set_index("timestamp")[ref_site_cols].resample("D").sum()
-        st.subheader("Daily ET totals: Reference vs Site")
+        st.subheader("Daily ET totals: Reference, existing baseline, and scenario")
         st.line_chart(daily_ref_site)
 
         daily_zones = df.set_index("timestamp")[zone_cols].resample("D").sum()
@@ -830,7 +836,7 @@ if results is not None:
         st.line_chart(daily_zones)
 
         monthly_ref_site = df.set_index("timestamp")[ref_site_cols].resample("ME").sum()
-        st.subheader("Monthly ET totals: Reference vs Site")
+        st.subheader("Monthly ET totals: Reference, existing baseline, and scenario")
         st.line_chart(monthly_ref_site)
 
         monthly_zones = df.set_index("timestamp")[zone_cols].resample("ME").sum()
@@ -843,7 +849,7 @@ if results is not None:
         st.subheader("Annual ET totals")
         annual_label = str(annual_ref_site.index[-1].year) if len(annual_ref_site.index) > 0 else "Year"
         et0_total = annual_ref_site["ET0_mm_h"].iloc[-1] if "ET0_mm_h" in annual_ref_site.columns else 0.0
-        et_site_total = annual_ref_site["ET_site_mm_h"].iloc[-1] if "ET_site_mm_h" in annual_ref_site.columns else 0.0
+        et_site_total = annual_ref_site["ET_existing_mm_h"].iloc[-1] if "ET_existing_mm_h" in annual_ref_site.columns else 0.0
 
         zone_order = ["ET_tree_mm_h", "ET_grass_mm_h", "ET_water_mm_h", "ET_hard_mm_h", "ET_rem_mm_h"]
         zone_name_map = {
@@ -857,7 +863,7 @@ if results is not None:
         if PLOTLY_AVAILABLE:
             annual_fig = go.Figure()
             annual_fig.add_trace(go.Bar(name="ET0", x=["ET0"], y=[et0_total]))
-            annual_fig.add_trace(go.Bar(name="ET site", x=["ET site"], y=[et_site_total]))
+            annual_fig.add_trace(go.Bar(name="Existing baseline", x=["Existing baseline"], y=[et_site_total]))
             for col in zone_order:
                 if col in annual_zones.columns:
                     annual_fig.add_trace(go.Bar(name=zone_name_map[col], x=["Zone breakdown"], y=[annual_zones[col].iloc[-1]]))
@@ -876,11 +882,11 @@ if results is not None:
             zone_total = annual_zones.sum(axis=1).iloc[-1] if len(annual_zones) > 0 else 0.0
             simple_df = pd.DataFrame({
                 "Annual ET (mm)": [et0_total, et_site_total, zone_total]
-            }, index=["ET0", "ET site", "Zone breakdown"])
+            }, index=["ET0", "Existing baseline", "Zone breakdown"])
             st.bar_chart(simple_df)
 
     with tab3:
-        vol_cols = ["Site_ET_m3_h", "Total_Weighted_ET_m3_h", "Site_Cooling_kWh_h", "Total_Weighted_Cooling_kWh_h", "Rem_ET_m3_h", "Rem_Cooling_kWh_h"]
+        vol_cols = ["Existing_ET_m3_h", "Total_Weighted_ET_m3_h", "Existing_Cooling_kWh_h", "Total_Weighted_Cooling_kWh_h", "Rem_ET_m3_h", "Rem_Cooling_kWh_h"]
         if tree_area > 0:
             vol_cols += ["Tree_ET_m3_h", "Tree_Cooling_kWh_h"]
         if grass_area > 0:
@@ -907,7 +913,7 @@ if results is not None:
 
     with tab4:
         export_cols = [
-            "timestamp", "ET0_mm_h", "ET_site_mm_h", "ET_rem_mm_h", "ET_tree_mm_h", "ET_grass_mm_h", "ET_water_mm_h", "ET_hard_mm_h",
+            "timestamp", "ET0_mm_h", "ET_existing_mm_h", "ET_scenario_mm_h", "ET_rem_mm_h", "ET_tree_mm_h", "ET_grass_mm_h", "ET_water_mm_h", "ET_hard_mm_h",
             "Site_ET_m3_h", "Tree_ET_m3_h", "Grass_ET_m3_h", "Water_ET_m3_h", "Hard_ET_m3_h", "Rem_ET_m3_h", "Total_Weighted_ET_m3_h",
             "Site_Cooling_kWh_h", "Tree_Cooling_kWh_h", "Grass_Cooling_kWh_h", "Water_Cooling_kWh_h", "Hard_Cooling_kWh_h", "Rem_Cooling_kWh_h", "Total_Weighted_Cooling_kWh_h"
         ]
