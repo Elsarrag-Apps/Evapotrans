@@ -82,6 +82,24 @@ def make_representative_timestamp(month_series, day_series, hour_series, fixed_y
     )
 
 
+@st.cache_data(show_spinner=False)
+def search_locations(query, limit=5):
+    if not query or len(query.strip()) < 3:
+        return []
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {
+        "q": query,
+        "format": "jsonv2",
+        "addressdetails": 1,
+        "limit": limit,
+        "countrycodes": "gb"
+    }
+    headers = {"User-Agent": "site-et-app"}
+    resp = requests.get(url, params=params, headers=headers, timeout=10)
+    resp.raise_for_status()
+    return resp.json()
+
+
 def read_epw(uploaded_file):
     raw = uploaded_file.getvalue().decode("utf-8", errors="ignore").splitlines()
     if len(raw) < 9:
@@ -357,28 +375,37 @@ with st.sidebar:
 
     # Location search
     st.markdown("**Location search**")
-    search_query = st.text_input("Search address or place")
-    if st.button("Go to location") and search_query:
+    search_query = st.text_input("Search address, postcode, or place", placeholder="Start typing at least 3 characters")
+
+    search_results = []
+    if search_query and len(search_query.strip()) >= 3:
         try:
-            url = "https://nominatim.openstreetmap.org/search"
-            params = {"q": search_query, "format": "json", "limit": 1}
-            headers = {"User-Agent": "site-et-app"}
-            resp = requests.get(url, params=params, headers=headers, timeout=10)
-            data = resp.json()
-            if data:
-                lat = float(data[0]["lat"])
-                lon = float(data[0]["lon"])
-                st.session_state.center = [lat, lon]
-                st.session_state.zoom = 17
-            else:
-                st.warning("Location not found")
+            search_results = search_locations(search_query, limit=6)
         except Exception as e:
             st.warning(f"Search failed: {e}")
+
+    selected_result = None
+    if search_results:
+        labels = [item.get("display_name", "Unknown location") for item in search_results]
+        selected_label = st.selectbox("Select a matching location", labels, index=0)
+        selected_result = search_results[labels.index(selected_label)]
+
+    if st.button("Go to location"):
+        if selected_result is not None:
+            lat = float(selected_result["lat"])
+            lon = float(selected_result["lon"])
+            st.session_state.center = [lat, lon]
+            st.session_state.zoom = 18
+            st.session_state.map_key_suffix += 1
+            st.rerun()
+        elif search_query:
+            st.warning("No matching location found. Try a fuller address or postcode.")
 
     clear = st.button("Clear polygons")
     run = st.button("Run model", type="primary")
     st.markdown("**Drawing rule**")
     st.caption("First polygon = site AOI. Additional polygons can be assigned below the map to Trees, Grass / planting, Water, or Hardscape. You can assign more than one polygon to each type.")
+    st.caption("Location search now returns matching address options. Select one, then click 'Go to location' to zoom the map there.")
 
 # -----------------------------
 # Session state
