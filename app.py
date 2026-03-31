@@ -911,3 +911,4 @@ if results is not None:
         csv_data = df[export_cols].to_csv(index=False).encode("utf-8")
         st.download_button("Download results CSV", data=csv_data, file_name="site_et_results.csv", mime="text/csv")
         st.caption("Weighted ET volume uses polygon area. Cooling is shown as a latent cooling equivalent based on evapotranspiration, not as a direct air-temperature reduction or HVAC load. NDVI zoning is automatic by default, and any additional polygons can be assigned to Trees, Grass / planting, Water, or Hardscape as manual override zones. You can assign more than one polygon to each type.")
+
