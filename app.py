@@ -658,6 +658,36 @@ if results is not None:
             r3.metric("Remainder auto hard", f"{100 * stats['rem_hard_frac_auto']:.1f}%")
 
         st.subheader("Key totals")
+
+        # -----------------------------
+        # Mass balance check (ET consistency)
+        # -----------------------------
+        st.subheader("ET consistency check")
+        # Compute component sum (depth-based)
+        comp_cols = ["ET_rem_mm_h"]
+        if tree_area > 0:
+            comp_cols.append("ET_tree_mm_h")
+        if grass_area > 0:
+            comp_cols.append("ET_grass_mm_h")
+        if water_area > 0:
+            comp_cols.append("ET_water_mm_h")
+        if hard_area > 0:
+            comp_cols.append("ET_hard_mm_h")
+
+        comp_sum = df[comp_cols].fillna(0).sum(axis=1)
+        site_series = df["ET_site_mm_h"]
+
+        # Compare annual totals
+        site_total = site_series.sum()
+        comp_total = comp_sum.sum()
+        diff = comp_total - site_total
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Site ET (total)", f"{site_total:,.1f} mm")
+        c2.metric("Sum of components", f"{comp_total:,.1f} mm")
+        c3.metric("Difference", f"{diff:,.2f} mm")
+
+        st.caption("Check: ET_site ≈ sum of ET_rem + ET_tree + ET_grass + ET_water + ET_hard. Small differences can occur due to averaging vs zoning.")
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Annual site ET", f"{df['ET_site_mm_h'].sum():,.1f} mm")
         k2.metric("Annual weighted ET", f"{df['Total_Weighted_ET_m3_h'].sum():,.0f} m3")
@@ -694,29 +724,46 @@ if results is not None:
         st.dataframe(pd.DataFrame(summary.items(), columns=["Metric", "Value"]).style.format({"Value": "{:.2f}"}), use_container_width=True)
 
     with tab2:
-        st.subheader("Hourly ET")
-        plot_cols = ["ET0_mm_h", "ET_site_mm_h", "ET_rem_mm_h"]
+        ref_site_cols = ["ET0_mm_h", "ET_site_mm_h"]
+        zone_cols = ["ET_rem_mm_h"]
         if tree_area > 0:
-            plot_cols.append("ET_tree_mm_h")
+            zone_cols.append("ET_tree_mm_h")
         if grass_area > 0:
-            plot_cols.append("ET_grass_mm_h")
+            zone_cols.append("ET_grass_mm_h")
         if water_area > 0:
-            plot_cols.append("ET_water_mm_h")
+            zone_cols.append("ET_water_mm_h")
         if hard_area > 0:
-            plot_cols.append("ET_hard_mm_h")
-        st.line_chart(df.set_index("timestamp")[plot_cols])
+            zone_cols.append("ET_hard_mm_h")
 
-        daily = df.set_index("timestamp")[plot_cols].resample("D").sum()
-        st.subheader("Daily ET totals")
-        st.line_chart(daily)
+        st.subheader("Hourly ET: Reference vs Site")
+        st.line_chart(df.set_index("timestamp")[ref_site_cols])
 
-        monthly = df.set_index("timestamp")[plot_cols].resample("ME").sum()
-        st.subheader("Monthly ET totals")
-        st.line_chart(monthly)
+        st.subheader("Hourly ET: Site breakdown")
+        st.line_chart(df.set_index("timestamp")[zone_cols])
 
-        annual = df.set_index("timestamp")[plot_cols].resample("YE").sum()
-        st.subheader("Annual ET totals")
-        st.bar_chart(annual)
+        daily_ref_site = df.set_index("timestamp")[ref_site_cols].resample("D").sum()
+        st.subheader("Daily ET totals: Reference vs Site")
+        st.line_chart(daily_ref_site)
+
+        daily_zones = df.set_index("timestamp")[zone_cols].resample("D").sum()
+        st.subheader("Daily ET totals: Site breakdown")
+        st.line_chart(daily_zones)
+
+        monthly_ref_site = df.set_index("timestamp")[ref_site_cols].resample("ME").sum()
+        st.subheader("Monthly ET totals: Reference vs Site")
+        st.line_chart(monthly_ref_site)
+
+        monthly_zones = df.set_index("timestamp")[zone_cols].resample("ME").sum()
+        st.subheader("Monthly ET totals: Site breakdown")
+        st.line_chart(monthly_zones)
+
+        annual_ref_site = df.set_index("timestamp")[ref_site_cols].resample("YE").sum()
+        st.subheader("Annual ET totals: Reference vs Site")
+        st.bar_chart(annual_ref_site)
+
+        annual_zones = df.set_index("timestamp")[zone_cols].resample("YE").sum()
+        st.subheader("Annual ET totals: Site breakdown")
+        st.bar_chart(annual_zones)
 
     with tab3:
         vol_cols = ["Site_ET_m3_h", "Total_Weighted_ET_m3_h", "Site_Cooling_kWh_h", "Total_Weighted_Cooling_kWh_h", "Rem_ET_m3_h", "Rem_Cooling_kWh_h"]
