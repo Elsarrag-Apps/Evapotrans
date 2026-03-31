@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import requests
+import plotly.graph_objects as go
 from folium.plugins import Draw
 from shapely.geometry import shape, mapping
 from shapely.ops import unary_union
@@ -833,12 +834,46 @@ if results is not None:
         st.line_chart(monthly_zones)
 
         annual_ref_site = df.set_index("timestamp")[ref_site_cols].resample("YE").sum()
-        st.subheader("Annual ET totals: Reference vs Site")
-        st.bar_chart(annual_ref_site)
-
         annual_zones = df.set_index("timestamp")[zone_cols].resample("YE").sum()
-        st.subheader("Annual ET totals: Site breakdown")
-        st.bar_chart(annual_zones)
+
+        st.subheader("Annual ET totals")
+        annual_label = str(annual_ref_site.index[-1].year) if len(annual_ref_site.index) > 0 else "Year"
+        annual_fig = go.Figure()
+        annual_fig.add_trace(go.Bar(name="ET0", x=[annual_label], y=[annual_ref_site["ET0_mm_h"].iloc[-1]]))
+        annual_fig.add_trace(go.Bar(name="ET site", x=[annual_label], y=[annual_ref_site["ET_site_mm_h"].iloc[-1]]))
+
+        zone_order = ["ET_tree_mm_h", "ET_grass_mm_h", "ET_water_mm_h", "ET_hard_mm_h", "ET_rem_mm_h"]
+        zone_name_map = {
+            "ET_tree_mm_h": "Trees",
+            "ET_grass_mm_h": "Grass / planting",
+            "ET_water_mm_h": "Water",
+            "ET_hard_mm_h": "Hardscape",
+            "ET_rem_mm_h": "Remainder",
+        }
+        for col in zone_order:
+            if col in annual_zones.columns:
+                annual_fig.add_trace(go.Bar(name=zone_name_map[col], x=[annual_label], y=[annual_zones[col].iloc[-1]], xaxis="x2", yaxis="y2"))
+
+        annual_fig.update_layout(
+            barmode="stack",
+            grid=dict(rows=1, columns=3, pattern="independent"),
+            showlegend=True,
+            xaxis=dict(domain=[0.0, 0.22], title="ET0"),
+            yaxis=dict(title="Annual ET (mm)"),
+            xaxis2=dict(domain=[0.39, 0.61], title="ET site"),
+            yaxis2=dict(title="Annual ET (mm)", matches="y"),
+            xaxis3=dict(domain=[0.78, 1.0], title="Zone breakdown"),
+            yaxis3=dict(title="Annual ET (mm)", matches="y"),
+            bargap=0.45,
+            margin=dict(l=40, r=20, t=20, b=40),
+            height=430,
+        )
+        # move stacked traces to third panel
+        for i in range(2, len(annual_fig.data)):
+            annual_fig.data[i].xaxis = "x3"
+            annual_fig.data[i].yaxis = "y3"
+
+        st.plotly_chart(annual_fig, use_container_width=True)
 
     with tab3:
         vol_cols = ["Site_ET_m3_h", "Total_Weighted_ET_m3_h", "Site_Cooling_kWh_h", "Total_Weighted_Cooling_kWh_h", "Rem_ET_m3_h", "Rem_Cooling_kWh_h"]
