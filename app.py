@@ -616,6 +616,7 @@ if run:
         rem_tree_area_auto = float(stats_scenario.get("rem_tree_area_auto_m2", 0.0))
         rem_grass_area_auto = float(stats_scenario.get("rem_grass_area_auto_m2", 0.0))
         rem_hard_area_auto = float(stats_scenario.get("rem_hard_area_auto_m2", 0.0))
+        existing_auto_green_water_area = float(stats_existing.get("tree_area_auto_m2", 0.0)) + float(stats_existing.get("grass_area_auto_m2", 0.0))
         net_benchmark_area = tree_area + grass_area + water_area + rem_tree_area_auto + rem_grass_area_auto
 
         df["ET_existing_mm_h"] = df["ET0_mm_h"] * stats_existing["site_kc"]
@@ -664,6 +665,7 @@ if run:
             "hard_area": hard_area,
             "rem_area": rem_area,
             "net_benchmark_area": net_benchmark_area,
+            "existing_auto_green_water_area": existing_auto_green_water_area,
             "override_present": bool(override_geom),
             "ee_warning": ee_warning,
         }
@@ -675,7 +677,7 @@ if results is not None and isinstance(results.get("df"), pd.DataFrame):
 required_result_keys = {
     "df", "stats_existing", "stats_scenario", "aoi_area", "tree_area",
     "grass_area", "water_area", "hard_area", "rem_area",
-    "net_benchmark_area", "override_present", "ee_warning"
+    "net_benchmark_area", "existing_auto_green_water_area", "override_present", "ee_warning"
 }
 if results is not None and not required_result_keys.issubset(set(results.keys())):
     st.session_state.results = None
@@ -693,6 +695,7 @@ if results is not None:
     hard_area = results["hard_area"]
     rem_area = results["rem_area"]
     net_benchmark_area = results["net_benchmark_area"]
+    existing_auto_green_water_area = results["existing_auto_green_water_area"]
     override_present = results["override_present"]
     ee_warning = results["ee_warning"]
 
@@ -761,7 +764,11 @@ if results is not None:
         actual_cooling_total = df["Scenario_Cooling_kWh_h"].sum()
         cooling_difference = actual_cooling_total - baseline_cooling_total
         cooling_percent = (cooling_difference / baseline_cooling_total * 100.0) if baseline_cooling_total != 0 else np.nan
-        annual_net_benchmark = actual_cooling_total / net_benchmark_area if net_benchmark_area > 0 else np.nan
+        baseline_gross_kwh_m2 = baseline_cooling_total / aoi_area if aoi_area and aoi_area > 0 else np.nan
+        baseline_net_kwh_m2 = baseline_cooling_total / existing_auto_green_water_area if existing_auto_green_water_area > 0 else np.nan
+        override_gross_kwh_m2 = actual_cooling_total / aoi_area if aoi_area and aoi_area > 0 else np.nan
+        override_net_kwh_m2 = actual_cooling_total / net_benchmark_area if net_benchmark_area > 0 else np.nan
+        annual_net_benchmark = override_net_kwh_m2
 
         st.subheader("Existing baseline vs scenario latent cooling")
         b1, b2, b3, b4 = st.columns(4)
@@ -774,7 +781,14 @@ if results is not None:
         k1.metric("Existing baseline ET", f"{df['ET_existing_mm_h'].sum():,.1f} mm")
         k2.metric("Scenario ET volume", f"{df['Total_Weighted_ET_m3_h'].sum():,.0f} m3")
         k3.metric("Annual scenario latent cooling", f"{actual_cooling_total:,.0f} kWh")
-        k4.metric("Net cooling benchmark", f"{annual_net_benchmark:,.2f} kWh/m2" if pd.notna(annual_net_benchmark) else "-")
+        k4.metric("Override net cooling benchmark", f"{annual_net_benchmark:,.2f} kWh/m2" if pd.notna(annual_net_benchmark) else "-")
+
+        st.subheader("Cooling benchmarks")
+        cb1, cb2, cb3, cb4 = st.columns(4)
+        cb1.metric("Baseline cooling (gross site area)", f"{baseline_gross_kwh_m2:,.2f} kWh/m2" if pd.notna(baseline_gross_kwh_m2) else "-")
+        cb2.metric("Baseline cooling (net green + water area)", f"{baseline_net_kwh_m2:,.2f} kWh/m2" if pd.notna(baseline_net_kwh_m2) else "-")
+        cb3.metric("Override cooling (gross site area)", f"{override_gross_kwh_m2:,.2f} kWh/m2" if pd.notna(override_gross_kwh_m2) else "-")
+        cb4.metric("Override cooling (net green + water area)", f"{override_net_kwh_m2:,.2f} kWh/m2" if pd.notna(override_net_kwh_m2) else "-")
 
         summary = {
             "Total ET0 (mm)": df["ET0_mm_h"].sum(),
@@ -794,7 +808,12 @@ if results is not None:
             "Remainder auto tree area (m2)": rem_tree_area_auto,
             "Remainder auto grass area (m2)": rem_grass_area_auto,
             "Remainder auto hard area (m2)": rem_hard_area_auto,
-            "Net green + water area used for benchmark (m2)": net_benchmark_area,
+            "Existing auto green + water area used for baseline net benchmark (m2)": existing_auto_green_water_area,
+            "Net green + water area used for override benchmark (m2)": net_benchmark_area,
+            "Cooling baseline (kWh/m2 gross site area)": baseline_gross_kwh_m2,
+            "Cooling baseline (kWh/m2 net green + water area)": baseline_net_kwh_m2,
+            "Cooling override (kWh/m2 gross site area)": override_gross_kwh_m2,
+            "Cooling override (kWh/m2 net green + water area)": override_net_kwh_m2,
             "Net cooling benchmark (kWh/m2)": annual_net_benchmark,
             "Existing auto tree area from NDVI (m2)": stats_existing["tree_area_auto_m2"],
             "Existing auto grass area from NDVI (m2)": stats_existing["grass_area_auto_m2"],
