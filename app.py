@@ -10,6 +10,7 @@ import folium
 import numpy as np
 import pandas as pd
 import streamlit as st
+import requests
 from folium.plugins import Draw
 from shapely.geometry import shape, mapping
 from shapely.ops import unary_union
@@ -353,6 +354,27 @@ def sentinel_ndvi_kc_stats(aoi_geom, override_geom=None):
 with st.sidebar:
     st.header("Inputs")
     epw_file = st.file_uploader("Upload EPW", type=["epw"])
+
+    # Location search
+    st.markdown("**Location search**")
+    search_query = st.text_input("Search address or place")
+    if st.button("Go to location") and search_query:
+        try:
+            url = "https://nominatim.openstreetmap.org/search"
+            params = {"q": search_query, "format": "json", "limit": 1}
+            headers = {"User-Agent": "site-et-app"}
+            resp = requests.get(url, params=params, headers=headers, timeout=10)
+            data = resp.json()
+            if data:
+                lat = float(data[0]["lat"])
+                lon = float(data[0]["lon"])
+                st.session_state.center = [lat, lon]
+                st.session_state.zoom = 17
+            else:
+                st.warning("Location not found")
+        except Exception as e:
+            st.warning(f"Search failed: {e}")
+
     clear = st.button("Clear polygons")
     run = st.button("Run model", type="primary")
     st.markdown("**Drawing rule**")
@@ -389,7 +411,18 @@ if epw_file is not None:
 # -----------------------------
 # Map
 # -----------------------------
-m = folium.Map(location=st.session_state.center, zoom_start=st.session_state.zoom, control_scale=True)
+# Create map without default tiles to allow custom basemaps
+m = folium.Map(location=st.session_state.center, zoom_start=st.session_state.zoom, control_scale=True, tiles=None)
+
+# Base maps
+folium.TileLayer("OpenStreetMap", name="OpenStreetMap", control=True, show=True).add_to(m)
+folium.TileLayer(
+    tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+    attr="Esri World Imagery",
+    name="Satellite (Esri)",
+    control=True,
+    show=False
+).add_to(m)
 
 # Add Earth Engine NDVI layer if available
 try:
