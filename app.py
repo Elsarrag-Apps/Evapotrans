@@ -17,6 +17,16 @@ from pyproj import Geod
 from streamlit_folium import st_folium
 
 st.set_page_config(page_title="Site ET Tool", layout="wide")
+
+# -----------------------------
+# Company logo (optional)
+# -----------------------------
+# Place your logo file in the repo (e.g., "logo.png") or use a URL
+try:
+    st.image("logo.png", width=180)
+except Exception:
+    pass
+
 st.title("Site Evapotranspiration Tool")
 st.caption("Upload an EPW file, draw one site polygon, and optionally add additional polygons for trees, grass, water, or hardscape overrides.")
 st.markdown("""
