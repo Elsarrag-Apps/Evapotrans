@@ -841,49 +841,42 @@ if results is not None:
         annual_zones = df.set_index("timestamp")[zone_cols].resample("YE").sum()
 
         st.subheader("Annual ET totals")
-        if PLOTLY_AVAILABLE:
-            annual_label = str(annual_ref_site.index[-1].year) if len(annual_ref_site.index) > 0 else "Year"
-            annual_fig = go.Figure()
-            annual_fig.add_trace(go.Bar(name="ET0", x=[annual_label], y=[annual_ref_site["ET0_mm_h"].iloc[-1]]))
-            annual_fig.add_trace(go.Bar(name="ET site", x=[annual_label], y=[annual_ref_site["ET_site_mm_h"].iloc[-1]]))
+        annual_label = str(annual_ref_site.index[-1].year) if len(annual_ref_site.index) > 0 else "Year"
+        et0_total = annual_ref_site["ET0_mm_h"].iloc[-1] if "ET0_mm_h" in annual_ref_site.columns else 0.0
+        et_site_total = annual_ref_site["ET_site_mm_h"].iloc[-1] if "ET_site_mm_h" in annual_ref_site.columns else 0.0
 
-            zone_order = ["ET_tree_mm_h", "ET_grass_mm_h", "ET_water_mm_h", "ET_hard_mm_h", "ET_rem_mm_h"]
-            zone_name_map = {
-                "ET_tree_mm_h": "Trees",
-                "ET_grass_mm_h": "Grass / planting",
-                "ET_water_mm_h": "Water",
-                "ET_hard_mm_h": "Hardscape",
-                "ET_rem_mm_h": "Remainder",
-            }
+        zone_order = ["ET_tree_mm_h", "ET_grass_mm_h", "ET_water_mm_h", "ET_hard_mm_h", "ET_rem_mm_h"]
+        zone_name_map = {
+            "ET_tree_mm_h": "Trees",
+            "ET_grass_mm_h": "Grass / planting",
+            "ET_water_mm_h": "Water",
+            "ET_hard_mm_h": "Hardscape",
+            "ET_rem_mm_h": "Remainder",
+        }
+
+        if PLOTLY_AVAILABLE:
+            annual_fig = go.Figure()
+            annual_fig.add_trace(go.Bar(name="ET0", x=["ET0"], y=[et0_total]))
+            annual_fig.add_trace(go.Bar(name="ET site", x=["ET site"], y=[et_site_total]))
             for col in zone_order:
                 if col in annual_zones.columns:
-                    annual_fig.add_trace(go.Bar(name=zone_name_map[col], x=[annual_label], y=[annual_zones[col].iloc[-1]], xaxis="x2", yaxis="y2"))
+                    annual_fig.add_trace(go.Bar(name=zone_name_map[col], x=["Zone breakdown"], y=[annual_zones[col].iloc[-1]]))
 
             annual_fig.update_layout(
                 barmode="stack",
-                grid=dict(rows=1, columns=3, pattern="independent"),
-                showlegend=True,
-                xaxis=dict(domain=[0.0, 0.22], title="ET0"),
+                xaxis=dict(title=annual_label),
                 yaxis=dict(title="Annual ET (mm)"),
-                xaxis2=dict(domain=[0.39, 0.61], title="ET site"),
-                yaxis2=dict(title="Annual ET (mm)", matches="y"),
-                xaxis3=dict(domain=[0.78, 1.0], title="Zone breakdown"),
-                yaxis3=dict(title="Annual ET (mm)", matches="y"),
-                bargap=0.45,
+                bargap=0.55,
                 margin=dict(l=40, r=20, t=20, b=40),
                 height=430,
+                legend_title_text="Series"
             )
-            for i in range(2, len(annual_fig.data)):
-                annual_fig.data[i].xaxis = "x3"
-                annual_fig.data[i].yaxis = "y3"
-
             st.plotly_chart(annual_fig, use_container_width=True)
         else:
-            st.warning("Plotly not installed – showing simplified annual chart")
+            zone_total = annual_zones.sum(axis=1).iloc[-1] if len(annual_zones) > 0 else 0.0
             simple_df = pd.DataFrame({
-                "ET0": [annual_ref_site["ET0_mm_h"].iloc[-1]],
-                "ET site": [annual_ref_site["ET_site_mm_h"].iloc[-1]]
-            })
+                "Annual ET (mm)": [et0_total, et_site_total, zone_total]
+            }, index=["ET0", "ET site", "Zone breakdown"])
             st.bar_chart(simple_df)
 
     with tab3:
@@ -922,4 +915,3 @@ if results is not None:
         csv_data = df[export_cols].to_csv(index=False).encode("utf-8")
         st.download_button("Download results CSV", data=csv_data, file_name="site_et_results.csv", mime="text/csv")
         st.caption("Weighted ET volume uses polygon area. Cooling is shown as a latent cooling equivalent based on evapotranspiration, not as a direct air-temperature reduction or HVAC load. NDVI zoning is automatic by default, and any additional polygons can be assigned to Trees, Grass / planting, Water, or Hardscape as manual override zones. You can assign more than one polygon to each type.")
-
