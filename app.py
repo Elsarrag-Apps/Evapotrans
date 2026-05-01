@@ -16,6 +16,12 @@ try:
     PLOTLY_AVAILABLE = True
 except Exception:
     PLOTLY_AVAILABLE = False
+
+try:
+    import altair as alt
+    ALTAIR_AVAILABLE = True
+except Exception:
+    ALTAIR_AVAILABLE = False
 from folium.plugins import Draw
 from shapely.geometry import shape, mapping
 from shapely.ops import unary_union
@@ -39,7 +45,7 @@ st.markdown("""
 4. In the polygon list below the map, assign each extra polygon to a type
 5. Click **Run model**
 """)
-st.info("The EPW is treated as a single representative year (2024) for hourly, daily, monthly, and annual summaries.")
+st.info("The uploaded EPW is treated as a representative weather profile. Its original year is not used for satellite analysis; Month/Day/Hour are mapped onto a fixed display year only for filtering and plotting.")
 
 ZONE_OPTIONS = ["Trees", "Grass / planting", "Water", "Hardscape"]
 ZONE_KC = {
@@ -73,7 +79,10 @@ EPW_COLUMNS = [
 ]
 
 
-def make_representative_timestamp(month_series, day_series, hour_series, fixed_year=2024):
+REPRESENTATIVE_WEATHER_YEAR = 2024
+
+
+def make_representative_timestamp(month_series, day_series, hour_series, fixed_year=REPRESENTATIVE_WEATHER_YEAR):
     return pd.to_datetime(
         dict(year=fixed_year, month=month_series, day=day_series, hour=hour_series),
         errors="coerce"
@@ -136,14 +145,14 @@ def read_epw(uploaded_file):
 
     df = df.dropna(subset=["Year", "Month", "Day"]).copy()
     df[["Year", "Month", "Day"]] = df[["Year", "Month", "Day"]].astype(int)
-    df["timestamp"] = make_representative_timestamp(df["Month"], df["Day"], df["Hour"], fixed_year=2024)
+    df["timestamp"] = make_representative_timestamp(df["Month"], df["Day"], df["Hour"], fixed_year=REPRESENTATIVE_WEATHER_YEAR)
 
     required_cols = ["DryBulb", "RH", "Pressure", "GlobalHorizontalRadiation", "WindSpeed", "Hour", "Year", "Month", "Day"]
     for req in required_cols:
         if req not in df.columns:
             raise ValueError(f"The EPW file is missing the required column: {req}")
 
-    numeric_cols = ["DryBulb", "RH", "Pressure", "GlobalHorizontalRadiation", "WindSpeed"]
+    numeric_cols = ["DryBulb", "RH", "Pressure", "GlobalHorizontalRadiation", "WindSpeed", "LiquidPrecipitationDepth"]
     for col in numeric_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -204,6 +213,31 @@ def et_mm_to_cooling_kwh(et_mm, area_m2_value, latent_heat_mj_per_kg=2.45):
     return energy_mj / 3.6
 
 
+def apply_rain_fed_bucket(et_potential_mm, rain_mm, max_storage_mm=40.0, initial_storage_fraction=0.5):
+    """
+    Simple hourly rain-fed soil/surface water bucket.
+
+    Potential ET is limited by available stored rainfall. This avoids assuming
+    unlimited irrigation for vegetation and wettable ground surfaces.
+
+    Inputs are depths in mm over the relevant surface.
+    """
+    storage = max_storage_mm * initial_storage_fraction
+    actual = []
+    storage_trace = []
+
+    for et_pot, rain in zip(et_potential_mm.fillna(0.0), rain_mm.fillna(0.0)):
+        rain = max(0.0, float(rain))
+        et_pot = max(0.0, float(et_pot))
+        storage = min(max_storage_mm, storage + rain)
+        et_act = min(et_pot, storage)
+        storage = max(0.0, storage - et_act)
+        actual.append(et_act)
+        storage_trace.append(storage)
+
+    return pd.Series(actual, index=et_potential_mm.index), pd.Series(storage_trace, index=et_potential_mm.index)
+
+
 def union_geoms(geoms):
     if not geoms:
         return None
@@ -241,34 +275,53 @@ def init_ee():
         return False
 
 
-def sentinel_ndvi_kc_stats(aoi_geom, override_geom=None):
+def sentinel_ndvi_kc_stats(aoi_geom, override_geom=None, satellite_year=2024):
     if not init_ee():
         raise RuntimeError("Earth Engine is not initialized. Add EE credentials or use the fallback coefficients.")
 
     aoi_ee = geometry_to_ee(aoi_geom)
-    start = "2024-04-01"
-    end = "2024-09-30"
+    start = f"{satellite_year}-05-01"
+    end = f"{satellite_year}-08-31"
+    cloud_thresholds = [20, 25, 30, 35, 40]
+    col = None
+    cloud_threshold_used = None
+    image_count_used = 0
 
-    col = (
-        ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-        .filterBounds(aoi_ee)
-        .filterDate(start, end)
-        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 20))
-    )
+    for cloud_limit in cloud_thresholds:
+        candidate_col = (
+            ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+            .filterBounds(aoi_ee)
+            .filterDate(start, end)
+            .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", cloud_limit))
+        )
+        candidate_count = candidate_col.size().getInfo()
+        if candidate_count > 0:
+            col = candidate_col
+            cloud_threshold_used = cloud_limit
+            image_count_used = candidate_count
+            break
 
-    if col.size().getInfo() == 0:
-        raise RuntimeError("No Sentinel-2 images were found for the AOI and date window.")
+    if col is None:
+        raise RuntimeError("No Sentinel-2 images were found for the AOI from May to August, even after relaxing cloud cover to 40%.")
 
     img = col.median().clip(aoi_ee)
     ndvi = img.normalizedDifference(["B8", "B4"]).rename("NDVI")
 
-    tree_mask = ndvi.gte(0.5).rename("tree_mask")
-    grass_mask = ndvi.gte(0.3).And(ndvi.lt(0.5)).rename("grass_mask")
-    hard_mask = ndvi.lt(0.3).rename("hard_mask")
+    ndwi = img.normalizedDifference(["B3", "B8"]).rename("NDWI")
+
+    # Classification order matters:
+    # 1) Water is detected first using NDWI, because water can have low NDVI and would otherwise be misclassified as hardscape.
+    # 2) Trees and grass are then classified from NDVI outside the water mask.
+    # 3) Anything remaining is treated as hardscape / low-vegetation surface.
+    water_mask = ndwi.gte(0.1).rename("water_mask")
+    tree_mask = ndvi.gte(0.5).And(water_mask.Not()).rename("tree_mask")
+    grass_mask = ndvi.gte(0.3).And(ndvi.lt(0.5)).And(water_mask.Not()).rename("grass_mask")
+    hard_mask = water_mask.Not().And(tree_mask.Not()).And(grass_mask.Not()).rename("hard_mask")
 
     kc_auto = (
         tree_mask.multiply(0.95)
         .add(grass_mask.multiply(0.65))
+        .add(water_mask.multiply(1.05))
         .add(hard_mask.multiply(0.20))
         .rename("Kc")
     )
@@ -279,12 +332,15 @@ def sentinel_ndvi_kc_stats(aoi_geom, override_geom=None):
         combined = ee.Image.cat([
             area_img,
             ndvi,
+            ndwi,
             kc_auto,
             tree_mask,
             grass_mask,
+            water_mask,
             hard_mask,
             tree_mask.multiply(area_img).rename("tree_area_m2"),
             grass_mask.multiply(area_img).rename("grass_area_m2"),
+            water_mask.multiply(area_img).rename("water_area_m2"),
             hard_mask.multiply(area_img).rename("hard_area_m2")
         ])
         stats = combined.reduceRegion(
@@ -293,7 +349,7 @@ def sentinel_ndvi_kc_stats(aoi_geom, override_geom=None):
             scale=10,
             maxPixels=1e10
         ).getInfo() or {}
-        sums = combined.select(["tree_area_m2", "grass_area_m2", "hard_area_m2"]).reduceRegion(
+        sums = combined.select(["tree_area_m2", "grass_area_m2", "water_area_m2", "hard_area_m2"]).reduceRegion(
             reducer=ee.Reducer.sum(),
             geometry=region_geom,
             scale=10,
@@ -304,24 +360,37 @@ def sentinel_ndvi_kc_stats(aoi_geom, override_geom=None):
     site_stats, site_sums = zonal_stats(aoi_ee)
     tree_area_auto = float(site_sums.get("tree_area_m2", 0.0))
     grass_area_auto = float(site_sums.get("grass_area_m2", 0.0))
+    water_area_auto = float(site_sums.get("water_area_m2", 0.0))
     hard_area_auto = float(site_sums.get("hard_area_m2", 0.0))
-    total_auto = tree_area_auto + grass_area_auto + hard_area_auto
+    total_auto = tree_area_auto + grass_area_auto + water_area_auto + hard_area_auto
 
     results = {
         "site_kc": float(site_stats.get("Kc", 0.5)),
         "site_ndvi": float(site_stats.get("NDVI", 0.3)),
         "tree_area_auto_m2": tree_area_auto,
         "grass_area_auto_m2": grass_area_auto,
+        "water_area_auto_m2": water_area_auto,
         "hard_area_auto_m2": hard_area_auto,
         "tree_frac_auto": (tree_area_auto / total_auto) if total_auto > 0 else 0.0,
         "grass_frac_auto": (grass_area_auto / total_auto) if total_auto > 0 else 0.0,
+        "water_frac_auto": (water_area_auto / total_auto) if total_auto > 0 else 0.0,
         "hard_frac_auto": (hard_area_auto / total_auto) if total_auto > 0 else 0.0,
         "tree_kc_auto": 0.95,
         "grass_kc_auto": 0.65,
+        "water_kc_auto": 1.05,
         "hard_kc_auto": 0.20,
+        "satellite_window_start": start,
+        "satellite_window_end": end,
+        "cloud_threshold_used": cloud_threshold_used,
+        "sentinel_image_count": image_count_used,
         "rem_tree_area_auto_m2": 0.0,
         "rem_grass_area_auto_m2": 0.0,
+        "rem_water_area_auto_m2": 0.0,
         "rem_hard_area_auto_m2": 0.0,
+        "satellite_window_start": start,
+        "satellite_window_end": end,
+        "cloud_threshold_used": cloud_threshold_used,
+        "sentinel_image_count": image_count_used,
     }
 
     if override_geom is not None and not override_geom.is_empty:
@@ -331,16 +400,19 @@ def sentinel_ndvi_kc_stats(aoi_geom, override_geom=None):
             rem_stats, rem_sums = zonal_stats(rem_ee)
             rem_tree_area = float(rem_sums.get("tree_area_m2", 0.0))
             rem_grass_area = float(rem_sums.get("grass_area_m2", 0.0))
+            rem_water_area = float(rem_sums.get("water_area_m2", 0.0))
             rem_hard_area = float(rem_sums.get("hard_area_m2", 0.0))
-            rem_total = rem_tree_area + rem_grass_area + rem_hard_area
+            rem_total = rem_tree_area + rem_grass_area + rem_water_area + rem_hard_area
             results.update({
                 "rem_kc": float(rem_stats.get("Kc", results["site_kc"])),
                 "rem_ndvi": float(rem_stats.get("NDVI", results["site_ndvi"])),
                 "rem_tree_frac_auto": (rem_tree_area / rem_total) if rem_total > 0 else 0.0,
                 "rem_grass_frac_auto": (rem_grass_area / rem_total) if rem_total > 0 else 0.0,
+                "rem_water_frac_auto": (rem_water_area / rem_total) if rem_total > 0 else 0.0,
                 "rem_hard_frac_auto": (rem_hard_area / rem_total) if rem_total > 0 else 0.0,
                 "rem_tree_area_auto_m2": rem_tree_area,
                 "rem_grass_area_auto_m2": rem_grass_area,
+                "rem_water_area_auto_m2": rem_water_area,
                 "rem_hard_area_auto_m2": rem_hard_area,
             })
         else:
@@ -349,9 +421,11 @@ def sentinel_ndvi_kc_stats(aoi_geom, override_geom=None):
                 "rem_ndvi": results["site_ndvi"],
                 "rem_tree_frac_auto": 0.0,
                 "rem_grass_frac_auto": 0.0,
+                "rem_water_frac_auto": 0.0,
                 "rem_hard_frac_auto": 0.0,
                 "rem_tree_area_auto_m2": 0.0,
                 "rem_grass_area_auto_m2": 0.0,
+                "rem_water_area_auto_m2": 0.0,
                 "rem_hard_area_auto_m2": 0.0,
             })
     else:
@@ -360,9 +434,11 @@ def sentinel_ndvi_kc_stats(aoi_geom, override_geom=None):
             "rem_ndvi": results["site_ndvi"],
             "rem_tree_frac_auto": results["tree_frac_auto"],
             "rem_grass_frac_auto": results["grass_frac_auto"],
+            "rem_water_frac_auto": results["water_frac_auto"],
             "rem_hard_frac_auto": results["hard_frac_auto"],
             "rem_tree_area_auto_m2": results["tree_area_auto_m2"],
             "rem_grass_area_auto_m2": results["grass_area_auto_m2"],
+            "rem_water_area_auto_m2": results["water_area_auto_m2"],
             "rem_hard_area_auto_m2": results["hard_area_auto_m2"],
         })
 
@@ -372,6 +448,37 @@ def sentinel_ndvi_kc_stats(aoi_geom, override_geom=None):
 with st.sidebar:
     st.header("Inputs")
     epw_file = st.file_uploader("Upload EPW", type=["epw"])
+
+    st.markdown("**Satellite classification year**")
+    satellite_year = st.number_input("Year used for Sentinel-2 land-cover classification", min_value=2017, max_value=2030, value=2024, step=1)
+    st.caption("This year is used only for satellite imagery. The uploaded EPW weather profile is independent of this year.")
+
+    st.markdown("**Rain-fed ET model**")
+    use_rain_fed_model = st.checkbox("Limit vegetation/ground ET by rainfall from EPW", value=True)
+    max_soil_storage_mm = st.number_input("Maximum rainfall storage (mm)", min_value=5.0, max_value=150.0, value=40.0, step=5.0)
+    initial_storage_fraction = st.slider("Initial storage at start of year", min_value=0.0, max_value=1.0, value=0.5, step=0.1)
+
+    st.markdown("**Analysis period**")
+    analysis_month_options = list(range(1, 13))
+    analysis_day_options = list(range(1, 32))
+
+    p1, p2 = st.columns(2)
+    with p1:
+        start_month = st.selectbox("Start month", analysis_month_options, index=5)
+        start_day = st.selectbox("Start day", analysis_day_options, index=0)
+    with p2:
+        end_month = st.selectbox("End month", analysis_month_options, index=7)
+        end_day = st.selectbox("End day", analysis_day_options, index=30)
+
+    try:
+        analysis_start_date = pd.to_datetime(f"{REPRESENTATIVE_WEATHER_YEAR}-{start_month:02d}-{start_day:02d}").date()
+        analysis_end_date = pd.to_datetime(f"{REPRESENTATIVE_WEATHER_YEAR}-{end_month:02d}-{end_day:02d}").date()
+        if analysis_end_date < analysis_start_date:
+            st.warning("End date must be after start date within the representative weather profile.")
+    except Exception:
+        st.warning("Invalid day/month selection. Please choose a valid date.")
+        analysis_start_date = pd.to_datetime(f"{REPRESENTATIVE_WEATHER_YEAR}-06-01").date()
+        analysis_end_date = pd.to_datetime(f"{REPRESENTATIVE_WEATHER_YEAR}-08-31").date()
 
     st.markdown("**Location search**")
     search_query = st.text_input("Search address, postcode, or place", placeholder="Start typing at least 3 characters")
@@ -575,8 +682,11 @@ if run:
     else:
         with st.spinner("Calculating hourly ET0 from EPW..."):
             df = df_weather.copy()
-            df["timestamp"] = make_representative_timestamp(df["Month"], df["Day"], df["Hour"], fixed_year=2024)
+            df["timestamp"] = make_representative_timestamp(df["Month"], df["Day"], df["Hour"], fixed_year=REPRESENTATIVE_WEATHER_YEAR)
             df = df.dropna(subset=["timestamp", "DryBulb", "RH", "GlobalHorizontalRadiation", "WindSpeed"]).copy()
+            if "LiquidPrecipitationDepth" not in df.columns:
+                df["LiquidPrecipitationDepth"] = 0.0
+            df["LiquidPrecipitationDepth"] = pd.to_numeric(df["LiquidPrecipitationDepth"], errors="coerce").fillna(0.0).clip(lower=0.0)
             df = df.sort_values("timestamp").reset_index(drop=True)
             if df.empty:
                 st.error("No valid hourly rows were found in the EPW after parsing.")
@@ -586,45 +696,81 @@ if run:
         ee_warning = None
         with st.spinner("Fetching NDVI and Kc from Earth Engine..."):
             try:
-                stats_existing = sentinel_ndvi_kc_stats(aoi_geom, override_geom=None)
-                stats_scenario = sentinel_ndvi_kc_stats(aoi_geom, override_geom=override_geom)
+                stats_existing = sentinel_ndvi_kc_stats(aoi_geom, override_geom=None, satellite_year=int(satellite_year))
+                stats_scenario = sentinel_ndvi_kc_stats(aoi_geom, override_geom=override_geom, satellite_year=int(satellite_year))
             except Exception as e:
-                ee_warning = f"Earth Engine step did not run: {e}"
+                ee_warning = f"Satellite classification did not run because Earth Engine is not available or not authenticated: {e}"
                 stats_existing = {
                     "site_kc": 0.45,
                     "site_ndvi": 0.25,
                     "tree_area_auto_m2": 0.0,
                     "grass_area_auto_m2": 0.0,
+                    "water_area_auto_m2": 0.0,
                     "hard_area_auto_m2": aoi_area or 0.0,
                     "tree_frac_auto": 0.0,
                     "grass_frac_auto": 0.0,
+                    "water_frac_auto": 0.0,
                     "hard_frac_auto": 1.0,
                     "tree_kc_auto": 0.95,
                     "grass_kc_auto": 0.65,
+                    "water_kc_auto": 1.05,
                     "hard_kc_auto": 0.20,
                     "rem_kc": 0.45,
                     "rem_ndvi": 0.25,
                     "rem_tree_frac_auto": 0.0,
                     "rem_grass_frac_auto": 0.0,
+                    "rem_water_frac_auto": 0.0,
                     "rem_hard_frac_auto": 1.0,
                     "rem_tree_area_auto_m2": 0.0,
                     "rem_grass_area_auto_m2": 0.0,
+                    "rem_water_area_auto_m2": 0.0,
                     "rem_hard_area_auto_m2": rem_area,
                 }
                 stats_scenario = dict(stats_existing)
 
         rem_tree_area_auto = float(stats_scenario.get("rem_tree_area_auto_m2", 0.0))
         rem_grass_area_auto = float(stats_scenario.get("rem_grass_area_auto_m2", 0.0))
+        rem_water_area_auto = float(stats_scenario.get("rem_water_area_auto_m2", 0.0))
         rem_hard_area_auto = float(stats_scenario.get("rem_hard_area_auto_m2", 0.0))
-        existing_auto_green_water_area = float(stats_existing.get("tree_area_auto_m2", 0.0)) + float(stats_existing.get("grass_area_auto_m2", 0.0))
-        net_benchmark_area = tree_area + grass_area + water_area + rem_tree_area_auto + rem_grass_area_auto
+        existing_auto_green_water_area = float(stats_existing.get("tree_area_auto_m2", 0.0)) + float(stats_existing.get("grass_area_auto_m2", 0.0)) + float(stats_existing.get("water_area_auto_m2", 0.0))
+        net_benchmark_area = tree_area + grass_area + water_area + rem_tree_area_auto + rem_grass_area_auto + rem_water_area_auto
 
-        df["ET_existing_mm_h"] = df["ET0_mm_h"] * stats_existing["site_kc"]
-        df["ET_tree_mm_h"] = df["ET0_mm_h"] * ZONE_KC["Trees"] if tree_area > 0 else np.nan
-        df["ET_grass_mm_h"] = df["ET0_mm_h"] * ZONE_KC["Grass / planting"] if grass_area > 0 else np.nan
+        # Potential ET assumes enough water is available. The rain-fed option then limits
+        # vegetation and wettable ground ET using rainfall from the EPW file.
+        df["ET_existing_potential_mm_h"] = df["ET0_mm_h"] * stats_existing["site_kc"]
+        df["ET_tree_potential_mm_h"] = df["ET0_mm_h"] * ZONE_KC["Trees"] if tree_area > 0 else np.nan
+        df["ET_grass_potential_mm_h"] = df["ET0_mm_h"] * ZONE_KC["Grass / planting"] if grass_area > 0 else np.nan
         df["ET_water_mm_h"] = df["ET0_mm_h"] * ZONE_KC["Water"] if water_area > 0 else np.nan
-        df["ET_hard_mm_h"] = df["ET0_mm_h"] * ZONE_KC["Hardscape"] if hard_area > 0 else np.nan
-        df["ET_rem_mm_h"] = df["ET0_mm_h"] * stats_scenario["rem_kc"]
+        df["ET_hard_potential_mm_h"] = df["ET0_mm_h"] * ZONE_KC["Hardscape"] if hard_area > 0 else np.nan
+        df["ET_rem_potential_mm_h"] = df["ET0_mm_h"] * stats_scenario["rem_kc"]
+
+        if use_rain_fed_model:
+            df["ET_existing_mm_h"], df["Existing_Water_Storage_mm"] = apply_rain_fed_bucket(
+                df["ET_existing_potential_mm_h"],
+                df["LiquidPrecipitationDepth"],
+                max_storage_mm=max_soil_storage_mm,
+                initial_storage_fraction=initial_storage_fraction,
+            )
+            if tree_area > 0:
+                df["ET_tree_mm_h"], df["Tree_Water_Storage_mm"] = apply_rain_fed_bucket(df["ET_tree_potential_mm_h"], df["LiquidPrecipitationDepth"], max_soil_storage_mm, initial_storage_fraction)
+            else:
+                df["ET_tree_mm_h"] = np.nan
+            if grass_area > 0:
+                df["ET_grass_mm_h"], df["Grass_Water_Storage_mm"] = apply_rain_fed_bucket(df["ET_grass_potential_mm_h"], df["LiquidPrecipitationDepth"], max_soil_storage_mm, initial_storage_fraction)
+            else:
+                df["ET_grass_mm_h"] = np.nan
+            if hard_area > 0:
+                # Hardscape evaporation is also rainfall-limited, with much smaller effective storage.
+                df["ET_hard_mm_h"], df["Hardscape_Water_Storage_mm"] = apply_rain_fed_bucket(df["ET_hard_potential_mm_h"], df["LiquidPrecipitationDepth"], min(5.0, max_soil_storage_mm), initial_storage_fraction)
+            else:
+                df["ET_hard_mm_h"] = np.nan
+            df["ET_rem_mm_h"], df["Remainder_Water_Storage_mm"] = apply_rain_fed_bucket(df["ET_rem_potential_mm_h"], df["LiquidPrecipitationDepth"], max_storage_mm=max_soil_storage_mm, initial_storage_fraction=initial_storage_fraction)
+        else:
+            df["ET_existing_mm_h"] = df["ET_existing_potential_mm_h"]
+            df["ET_tree_mm_h"] = df["ET_tree_potential_mm_h"]
+            df["ET_grass_mm_h"] = df["ET_grass_potential_mm_h"]
+            df["ET_hard_mm_h"] = df["ET_hard_potential_mm_h"]
+            df["ET_rem_mm_h"] = df["ET_rem_potential_mm_h"]
 
         df["Existing_ET_m3_h"] = df["ET_existing_mm_h"].apply(lambda x: mm_over_area_to_m3(x, aoi_area or 0.0))
         df["Existing_Cooling_kWh_h"] = df["ET_existing_mm_h"].apply(lambda x: et_mm_to_cooling_kwh(x, aoi_area or 0.0))
@@ -652,7 +798,7 @@ if run:
         df["Total_Weighted_Cooling_kWh_h"] = df[total_cooling_parts].fillna(0).sum(axis=1)
         df["ET_scenario_mm_h"] = df["Total_Weighted_ET_m3_h"].apply(lambda x: (x / (aoi_area or 1.0)) * 1000.0)
         df["Scenario_Cooling_kWh_h"] = df["Total_Weighted_Cooling_kWh_h"]
-        df["Net_Benchmark_kWh_m2_h"] = df["Scenario_Cooling_kWh_h"] / net_benchmark_area if net_benchmark_area > 0 else np.nan
+        df["Cooling_kWh_m2_h"] = df["Scenario_Cooling_kWh_h"] / net_benchmark_area if net_benchmark_area > 0 else np.nan
 
         st.session_state.results = {
             "df": df,
@@ -668,6 +814,11 @@ if run:
             "existing_auto_green_water_area": existing_auto_green_water_area,
             "override_present": bool(override_geom),
             "ee_warning": ee_warning,
+            "use_rain_fed_model": use_rain_fed_model,
+            "max_soil_storage_mm": max_soil_storage_mm,
+            "initial_storage_fraction": initial_storage_fraction,
+            "satellite_year": int(satellite_year),
+            "representative_weather_year": REPRESENTATIVE_WEATHER_YEAR,
         }
 
 results = st.session_state.results
@@ -677,7 +828,7 @@ if results is not None and isinstance(results.get("df"), pd.DataFrame):
 required_result_keys = {
     "df", "stats_existing", "stats_scenario", "aoi_area", "tree_area",
     "grass_area", "water_area", "hard_area", "rem_area",
-    "net_benchmark_area", "existing_auto_green_water_area", "override_present", "ee_warning"
+    "net_benchmark_area", "existing_auto_green_water_area", "override_present", "ee_warning", "use_rain_fed_model", "satellite_year", "representative_weather_year"
 }
 if results is not None and not required_result_keys.issubset(set(results.keys())):
     st.session_state.results = None
@@ -686,6 +837,12 @@ if results is not None and not required_result_keys.issubset(set(results.keys())
 
 if results is not None:
     df = results["df"]
+    period_start = pd.to_datetime(analysis_start_date)
+    period_end = pd.to_datetime(analysis_end_date) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+    df_period = df[(df["timestamp"] >= period_start) & (df["timestamp"] <= period_end)].copy()
+    if df_period.empty:
+        st.warning("No hourly weather rows were found for the selected period. Showing full-year results instead.")
+        df_period = df.copy()
     stats_existing = results["stats_existing"]
     stats_scenario = results["stats_scenario"]
     aoi_area = results["aoi_area"]
@@ -701,248 +858,276 @@ if results is not None:
 
     rem_tree_area_auto = float(stats_scenario.get("rem_tree_area_auto_m2", 0.0))
     rem_grass_area_auto = float(stats_scenario.get("rem_grass_area_auto_m2", 0.0))
+    rem_water_area_auto = float(stats_scenario.get("rem_water_area_auto_m2", 0.0))
     rem_hard_area_auto = float(stats_scenario.get("rem_hard_area_auto_m2", 0.0))
 
     if ee_warning:
-        st.warning(ee_warning)
-    elif st.session_state.get("ee_init_error"):
-        st.info(st.session_state["ee_init_error"])
+        st.error(ee_warning)
+        st.warning("The baseline/proposed site-composition charts are using fallback values, not real satellite classification. Configure Earth Engine credentials before trusting the land-cover split.")
 
-    tab1, tab2, tab3, tab4 = st.tabs(["Summary", "Time Series", "Volumes & Cooling", "Download"])
+    tab1, tab2, tab3 = st.tabs(["Summary", "Time Series Analysis", "Download / Print"])
 
     with tab1:
-        st.subheader("Spatial coefficients")
-        s1, s2, s3 = st.columns(3)
-        s1.metric("Existing site NDVI", f"{stats_existing['site_ndvi']:.3f}")
-        s2.metric("Existing site Kc", f"{stats_existing['site_kc']:.3f}")
-        s3.metric("Mean ET0", f"{df['ET0_mm_h'].mean():.3f} mm/h")
+        st.header("Cooling Impact of Site Design")
+        if ee_warning:
+            st.info(f"Baseline = fallback land-cover assumption because Earth Engine did not run. Proposed = manual overrides plus fallback remainder. Weather and rainfall come from the uploaded EPW profile and are mapped to {results.get('representative_weather_year')} only for plotting/filtering.")
+        else:
+            st.info(f"Baseline = satellite-derived existing site condition using Sentinel-2 imagery from {results.get('satellite_year')} during May-August. Proposed = manual overrides plus satellite-derived remainder. Weather and rainfall come from the uploaded EPW profile and are mapped to {results.get('representative_weather_year')} only for plotting/filtering.")
+            st.caption(f"Satellite imagery used: {stats_existing.get('sentinel_image_count', 0)} image(s), cloud-cover threshold <{stats_existing.get('cloud_threshold_used', 'N/A')}%.")
+        rain_model_text = "Rain-fed ET enabled: rainfall is taken from the uploaded EPW file." if results.get("use_rain_fed_model") else "Potential ET mode: surfaces are assumed to have enough water available."
+        st.caption(f"Results shown for selected representative period: {analysis_start_date.strftime('%d %b')} to {analysis_end_date.strftime('%d %b')}. Cooling intensity is normalised by total site area. {rain_model_text}")
 
-        st.subheader("Automatic NDVI zoning")
-        z1, z2, z3 = st.columns(3)
-        z1.metric("Existing auto tree cover", f"{100 * stats_existing['tree_frac_auto']:.1f}%")
-        z2.metric("Existing auto grass cover", f"{100 * stats_existing['grass_frac_auto']:.1f}%")
-        z3.metric("Existing auto hard cover", f"{100 * stats_existing['hard_frac_auto']:.1f}%")
+        baseline_cooling_total = df_period["Existing_Cooling_kWh_h"].sum()
+        proposed_cooling_total = df_period["Scenario_Cooling_kWh_h"].sum()
+        baseline_kwh_m2 = baseline_cooling_total / aoi_area if aoi_area and aoi_area > 0 else np.nan
+        proposed_kwh_m2 = proposed_cooling_total / aoi_area if aoi_area and aoi_area > 0 else np.nan
+        change_kwh_m2 = proposed_kwh_m2 - baseline_kwh_m2 if pd.notna(proposed_kwh_m2) and pd.notna(baseline_kwh_m2) else np.nan
+        change_percent = (change_kwh_m2 / baseline_kwh_m2 * 100.0) if pd.notna(change_kwh_m2) and baseline_kwh_m2 != 0 else np.nan
 
-        za1, za2, za3 = st.columns(3)
-        za1.metric("Existing auto tree area", f"{stats_existing['tree_area_auto_m2']:,.0f} m2")
-        za2.metric("Existing auto grass area", f"{stats_existing['grass_area_auto_m2']:,.0f} m2")
-        za3.metric("Existing auto hard area", f"{stats_existing['hard_area_auto_m2']:,.0f} m2")
+        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+        kpi1.metric("Baseline cooling", f"{baseline_kwh_m2:,.2f} kWh/m2" if pd.notna(baseline_kwh_m2) else "-")
+        kpi2.metric("Proposed cooling", f"{proposed_kwh_m2:,.2f} kWh/m2" if pd.notna(proposed_kwh_m2) else "-")
+        kpi3.metric("Change", f"{change_kwh_m2:+,.2f} kWh/m2" if pd.notna(change_kwh_m2) else "-")
+        kpi4.metric("Change", f"{change_percent:+,.1f}%" if pd.notna(change_percent) else "-")
 
-        st.subheader("Remainder area and split")
-        rr1, rr2, rr3, rr4 = st.columns(4)
-        rr1.metric("Remainder area", f"{rem_area:,.0f} m2")
-        rr2.metric("Remainder auto tree", f"{rem_tree_area_auto:,.0f} m2")
-        rr3.metric("Remainder auto grass", f"{rem_grass_area_auto:,.0f} m2")
-        rr4.metric("Remainder auto hard", f"{rem_hard_area_auto:,.0f} m2")
+        st.subheader("Baseline vs proposed cooling")
+        comparison_df = pd.DataFrame({
+            "Scenario": ["Baseline", "Proposed"],
+            "Cooling (kWh/m2)": [baseline_kwh_m2, proposed_kwh_m2]
+        })
+        comparison_df["Label"] = comparison_df["Cooling (kWh/m2)"].map(lambda x: f"{x:,.2f} kWh/m2" if pd.notna(x) else "-")
 
-        st.subheader("Net benchmark area")
-        nb1, nb2, nb3 = st.columns(3)
-        nb1.metric("Manual green + water", f"{tree_area + grass_area + water_area:,.0f} m2")
-        nb2.metric("Remainder green", f"{rem_tree_area_auto + rem_grass_area_auto:,.0f} m2")
-        nb3.metric("Net benchmark area", f"{net_benchmark_area:,.0f} m2")
+        if ALTAIR_AVAILABLE:
+            bar_chart = (
+                alt.Chart(comparison_df)
+                .mark_bar(size=34)
+                .encode(
+                    x=alt.X("Cooling (kWh/m2):Q", title="Cooling (kWh/m2)", axis=alt.Axis(labelFontSize=13, titleFontSize=14)),
+                    y=alt.Y("Scenario:N", title="", sort=["Baseline", "Proposed"], axis=alt.Axis(labelFontSize=14)),
+                    color=alt.Color(
+                        "Scenario:N",
+                        scale=alt.Scale(domain=["Baseline", "Proposed"], range=["#8A8A8A", "#2E7D32"]),
+                        legend=None,
+                    ),
+                    tooltip=["Scenario", alt.Tooltip("Cooling (kWh/m2):Q", format=",.2f")],
+                )
+                .properties(height=150)
+            )
+            bar_text = (
+                alt.Chart(comparison_df)
+                .mark_text(align="left", dx=8, fontSize=13, fontWeight="bold")
+                .encode(
+                    x="Cooling (kWh/m2):Q",
+                    y=alt.Y("Scenario:N", sort=["Baseline", "Proposed"]),
+                    text="Label:N",
+                )
+            )
+            st.altair_chart(bar_chart + bar_text, use_container_width=True)
+        elif PLOTLY_AVAILABLE:
+            fig_compare = go.Figure()
+            fig_compare.add_trace(go.Bar(
+                x=comparison_df["Cooling (kWh/m2)"],
+                y=comparison_df["Scenario"],
+                orientation="h",
+                text=comparison_df["Label"],
+                textposition="outside",
+                width=0.35,
+                marker_color=["#8A8A8A", "#2E7D32"],
+                showlegend=False,
+            ))
+            fig_compare.update_layout(height=220, margin=dict(l=20, r=80, t=10, b=30), xaxis_title="Cooling (kWh/m2)", yaxis_title="")
+            st.plotly_chart(fig_compare, use_container_width=True)
+        else:
+            st.bar_chart(comparison_df.set_index("Scenario")[["Cooling (kWh/m2)"]])
 
-        if override_present:
-            st.subheader("Manual override zones")
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Trees", f"{tree_area:,.0f} m2")
-            m2.metric("Grass / planting", f"{grass_area:,.0f} m2")
-            m3.metric("Water", f"{water_area:,.0f} m2")
-            m4.metric("Hardscape", f"{hard_area:,.0f} m2")
+        st.caption(f"Difference: {change_kwh_m2:+,.2f} kWh/m2 ({change_percent:+,.1f}%)" if pd.notna(change_kwh_m2) and pd.notna(change_percent) else "Difference: -")
 
-        st.subheader("Key totals")
-        total_volume = df["Total_Weighted_ET_m3_h"].sum()
-        comp_total = (total_volume / aoi_area) * 1000 if aoi_area else 0.0
-        site_total = df["ET_scenario_mm_h"].sum()
-        diff = comp_total - site_total
+        st.subheader("Site composition")
+        baseline_comp_df = pd.DataFrame({
+            "Scenario": "Baseline",
+            "Surface type": ["Trees", "Grass", "Water", "Hardscape"],
+            "Area (m2)": [
+                float(stats_existing.get("tree_area_auto_m2", 0.0)),
+                float(stats_existing.get("grass_area_auto_m2", 0.0)),
+                float(stats_existing.get("water_area_auto_m2", 0.0)),
+                float(stats_existing.get("hard_area_auto_m2", 0.0)),
+            ],
+        })
+        proposed_comp_df = pd.DataFrame({
+            "Scenario": "Proposed",
+            "Surface type": ["Trees", "Grass", "Water", "Hardscape"],
+            "Area (m2)": [
+                tree_area + rem_tree_area_auto,
+                grass_area + rem_grass_area_auto,
+                water_area + rem_water_area_auto,
+                hard_area + rem_hard_area_auto,
+            ],
+        })
+        composition_df = pd.concat([baseline_comp_df, proposed_comp_df], ignore_index=True)
+        composition_df = composition_df[composition_df["Area (m2)"] > 0].copy()
+        composition_df["Percent"] = composition_df.groupby("Scenario")["Area (m2)"].transform(lambda s: s / s.sum() * 100 if s.sum() > 0 else 0)
+        composition_df["Label"] = composition_df.apply(lambda r: f"{r['Area (m2)']:,.0f} m2 ({r['Percent']:.1f}%)", axis=1)
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Site ET (total)", f"{site_total:,.1f} mm")
-        c2.metric("Components (area-weighted)", f"{comp_total:,.1f} mm")
-        c3.metric("Difference", f"{diff:,.2f} mm")
+        surface_colors = alt.Scale(
+            domain=["Trees", "Grass", "Water", "Hardscape"],
+            range=["#2E7D32", "#7CB342", "#039BE5", "#9E9E9E"],
+        )
 
-        baseline_cooling_total = df["Existing_Cooling_kWh_h"].sum()
-        actual_cooling_total = df["Scenario_Cooling_kWh_h"].sum()
-        cooling_difference = actual_cooling_total - baseline_cooling_total
-        cooling_percent = (cooling_difference / baseline_cooling_total * 100.0) if baseline_cooling_total != 0 else np.nan
-        baseline_gross_kwh_m2 = baseline_cooling_total / aoi_area if aoi_area and aoi_area > 0 else np.nan
-        baseline_net_kwh_m2 = baseline_cooling_total / existing_auto_green_water_area if existing_auto_green_water_area > 0 else np.nan
-        override_gross_kwh_m2 = actual_cooling_total / aoi_area if aoi_area and aoi_area > 0 else np.nan
-        override_net_kwh_m2 = actual_cooling_total / net_benchmark_area if net_benchmark_area > 0 else np.nan
-        annual_net_benchmark = override_net_kwh_m2
+        if ALTAIR_AVAILABLE and not composition_df.empty:
+            c1, c2 = st.columns(2)
+            for scenario_name, chart_col in [("Baseline", c1), ("Proposed", c2)]:
+                scenario_df = composition_df[composition_df["Scenario"] == scenario_name]
+                pie = (
+                    alt.Chart(scenario_df)
+                    .mark_arc(innerRadius=55, outerRadius=105)
+                    .encode(
+                        theta=alt.Theta("Area (m2):Q"),
+                        color=alt.Color("Surface type:N", title="Surface type", scale=surface_colors),
+                        tooltip=[
+                            "Surface type",
+                            alt.Tooltip("Area (m2):Q", format=",.0f", title="Area (m2)"),
+                            alt.Tooltip("Percent:Q", format=".1f", title="Percent"),
+                        ],
+                    )
+                    .properties(title=scenario_name, height=300)
+                )
+                labels = (
+                    alt.Chart(scenario_df)
+                    .mark_text(radius=132, fontSize=12, fontWeight="bold")
+                    .encode(
+                        theta=alt.Theta("Area (m2):Q"),
+                        text="Label:N",
+                    )
+                )
+                chart_col.altair_chart(pie + labels, use_container_width=True)
 
-        st.subheader("Existing baseline vs scenario latent cooling")
-        b1, b2, b3, b4 = st.columns(4)
-        b1.metric("Existing baseline latent cooling", f"{baseline_cooling_total:,.0f} kWh")
-        b2.metric("Scenario latent cooling", f"{actual_cooling_total:,.0f} kWh")
-        b3.metric("Difference", f"{cooling_difference:,.0f} kWh")
-        b4.metric("Change vs baseline", f"{cooling_percent:,.1f}%" if pd.notna(cooling_percent) else "-")
+            st.dataframe(
+                composition_df[["Scenario", "Surface type", "Area (m2)", "Percent"]].style.format({"Area (m2)": "{:,.0f}", "Percent": "{:.1f}%"}),
+                use_container_width=True,
+                hide_index=True,
+            )
+        elif PLOTLY_AVAILABLE and not composition_df.empty:
+            c1, c2 = st.columns(2)
+            for scenario_name, chart_col in [("Baseline", c1), ("Proposed", c2)]:
+                scenario_df = composition_df[composition_df["Scenario"] == scenario_name]
+                fig_comp = go.Figure(data=[go.Pie(
+                    labels=scenario_df["Surface type"],
+                    values=scenario_df["Area (m2)"],
+                    hole=0.35,
+                    textinfo="label+value+percent",
+                    textfont_size=14,
+                    marker=dict(colors=["#2E7D32", "#7CB342", "#039BE5", "#9E9E9E"]),
+                    hovertemplate="%{label}<br>%{value:,.0f} m2<br>%{percent}<extra></extra>",
+                )])
+                fig_comp.update_layout(title=scenario_name, height=340, margin=dict(l=20, r=20, t=40, b=20), font=dict(size=14))
+                chart_col.plotly_chart(fig_comp, use_container_width=True)
+        else:
+            st.dataframe(composition_df[["Scenario", "Surface type", "Area (m2)", "Percent"]], use_container_width=True, hide_index=True)
 
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Existing baseline ET", f"{df['ET_existing_mm_h'].sum():,.1f} mm")
-        k2.metric("Scenario ET volume", f"{df['Total_Weighted_ET_m3_h'].sum():,.0f} m3")
-        k3.metric("Annual scenario latent cooling", f"{actual_cooling_total:,.0f} kWh")
-        k4.metric("Override net cooling benchmark", f"{annual_net_benchmark:,.2f} kWh/m2" if pd.notna(annual_net_benchmark) else "-")
+        with st.expander("Show technical details and full summary"):
+            st.subheader("Spatial coefficients")
+            s1, s2, s3 = st.columns(3)
+            s1.metric("Existing site NDVI", f"{stats_existing['site_ndvi']:.3f}")
+            s2.metric("Existing site Kc", f"{stats_existing['site_kc']:.3f}")
+            s3.metric("Mean ET0", f"{df_period['ET0_mm_h'].mean():.3f} mm/h")
 
-        st.subheader("Cooling benchmarks")
-        cb1, cb2, cb3, cb4 = st.columns(4)
-        cb1.metric("Baseline cooling (gross site area)", f"{baseline_gross_kwh_m2:,.2f} kWh/m2" if pd.notna(baseline_gross_kwh_m2) else "-")
-        cb2.metric("Baseline cooling (net green + water area)", f"{baseline_net_kwh_m2:,.2f} kWh/m2" if pd.notna(baseline_net_kwh_m2) else "-")
-        cb3.metric("Override cooling (gross site area)", f"{override_gross_kwh_m2:,.2f} kWh/m2" if pd.notna(override_gross_kwh_m2) else "-")
-        cb4.metric("Override cooling (net green + water area)", f"{override_net_kwh_m2:,.2f} kWh/m2" if pd.notna(override_net_kwh_m2) else "-")
+            st.subheader("Remainder area and split")
+            rr1, rr2, rr3, rr4, rr5 = st.columns(5)
+            rr1.metric("Remainder area", f"{rem_area:,.0f} m2")
+            rr2.metric("Remainder auto tree", f"{rem_tree_area_auto:,.0f} m2")
+            rr3.metric("Remainder auto grass", f"{rem_grass_area_auto:,.0f} m2")
+            rr4.metric("Remainder auto water", f"{rem_water_area_auto:,.0f} m2")
+            rr5.metric("Remainder auto hard", f"{rem_hard_area_auto:,.0f} m2")
 
-        summary = {
-            "Total ET0 (mm)": df["ET0_mm_h"].sum(),
-            "Existing baseline ET depth (mm)": df["ET_existing_mm_h"].sum(),
-            "Scenario ET depth (mm)": df["ET_scenario_mm_h"].sum(),
-            "Total weighted ET volume (m3)": df["Total_Weighted_ET_m3_h"].sum(),
-            "Existing baseline latent cooling equivalent (kWh)": baseline_cooling_total,
-            "Scenario latent cooling equivalent (kWh)": actual_cooling_total,
-            "Latent cooling difference vs baseline (kWh)": cooling_difference,
-            "Latent cooling change vs baseline (%)": cooling_percent,
-            "Site area (m2)": aoi_area or 0.0,
-            "Manual tree area (m2)": tree_area,
-            "Manual grass area (m2)": grass_area,
-            "Manual water area (m2)": water_area,
-            "Manual hardscape area (m2)": hard_area,
-            "Remainder area (m2)": rem_area,
-            "Remainder auto tree area (m2)": rem_tree_area_auto,
-            "Remainder auto grass area (m2)": rem_grass_area_auto,
-            "Remainder auto hard area (m2)": rem_hard_area_auto,
-            "Existing auto green + water area used for baseline net benchmark (m2)": existing_auto_green_water_area,
-            "Net green + water area used for override benchmark (m2)": net_benchmark_area,
-            "Cooling baseline (kWh/m2 gross site area)": baseline_gross_kwh_m2,
-            "Cooling baseline (kWh/m2 net green + water area)": baseline_net_kwh_m2,
-            "Cooling override (kWh/m2 gross site area)": override_gross_kwh_m2,
-            "Cooling override (kWh/m2 net green + water area)": override_net_kwh_m2,
-            "Net cooling benchmark (kWh/m2)": annual_net_benchmark,
-            "Existing auto tree area from NDVI (m2)": stats_existing["tree_area_auto_m2"],
-            "Existing auto grass area from NDVI (m2)": stats_existing["grass_area_auto_m2"],
-            "Existing auto hard area from NDVI (m2)": stats_existing["hard_area_auto_m2"],
-        }
-        summary["Total remainder ET depth (mm)"] = df["ET_rem_mm_h"].sum()
-        summary["Remainder ET volume (m3)"] = df["Rem_ET_m3_h"].sum()
-        summary["Remainder latent cooling equivalent (kWh)"] = df["Rem_Cooling_kWh_h"].sum()
-        if tree_area > 0:
-            summary["Tree ET volume (m3)"] = df["Tree_ET_m3_h"].sum()
-            summary["Tree latent cooling equivalent (kWh)"] = df["Tree_Cooling_kWh_h"].sum()
-        if grass_area > 0:
-            summary["Grass ET volume (m3)"] = df["Grass_ET_m3_h"].sum()
-            summary["Grass latent cooling equivalent (kWh)"] = df["Grass_Cooling_kWh_h"].sum()
-        if water_area > 0:
-            summary["Water ET volume (m3)"] = df["Water_ET_m3_h"].sum()
-            summary["Water latent cooling equivalent (kWh)"] = df["Water_Cooling_kWh_h"].sum()
-        if hard_area > 0:
-            summary["Hardscape ET volume (m3)"] = df["Hard_ET_m3_h"].sum()
-            summary["Hardscape latent cooling equivalent (kWh)"] = df["Hard_Cooling_kWh_h"].sum()
-        st.dataframe(pd.DataFrame(summary.items(), columns=["Metric", "Value"]).style.format({"Value": "{:.2f}"}), use_container_width=True)
+            summary = {
+                "Selected period baseline cooling (kWh)": baseline_cooling_total,
+                "Selected period proposed cooling (kWh)": proposed_cooling_total,
+                "Baseline cooling (kWh/m2 site area)": baseline_kwh_m2,
+                "Proposed cooling (kWh/m2 site area)": proposed_kwh_m2,
+                "Change (kWh/m2 site area)": change_kwh_m2,
+                "Change (%)": change_percent,
+                "Site area (m2)": aoi_area or 0.0,
+                "Manual tree area (m2)": tree_area,
+                "Manual grass area (m2)": grass_area,
+                "Manual water area (m2)": water_area,
+                "Manual hardscape area (m2)": hard_area,
+                "Remainder area (m2)": rem_area,
+                "Remainder auto tree area (m2)": rem_tree_area_auto,
+                "Remainder auto grass area (m2)": rem_grass_area_auto,
+                "Remainder auto water area (m2)": rem_water_area_auto,
+                "Remainder auto hard area (m2)": rem_hard_area_auto,
+                "Selected period ET0 (mm)": df_period["ET0_mm_h"].sum(),
+                "Selected period baseline ET depth (mm)": df_period["ET_existing_mm_h"].sum(),
+                "Selected period proposed ET depth (mm)": df_period["ET_scenario_mm_h"].sum(),
+                "Selected period weighted ET volume (m3)": df_period["Total_Weighted_ET_m3_h"].sum(),
+                "Selected period rainfall from EPW (mm)": df_period["LiquidPrecipitationDepth"].sum(),
+                "Satellite window start": stats_existing.get("satellite_window_start", ""),
+                "Satellite window end": stats_existing.get("satellite_window_end", ""),
+                "Satellite cloud threshold used (%)": stats_existing.get("cloud_threshold_used", np.nan),
+                "Sentinel-2 images used": stats_existing.get("sentinel_image_count", np.nan),
+                "Rain-fed ET model enabled": 1.0 if results.get("use_rain_fed_model") else 0.0,
+                "Maximum rainfall storage (mm)": results.get("max_soil_storage_mm", np.nan),
+            }
+            st.dataframe(pd.DataFrame(summary.items(), columns=["Metric", "Value"]).style.format({"Value": "{:.2f}"}), use_container_width=True)
 
     with tab2:
-        ref_site_cols = ["ET0_mm_h", "ET_existing_mm_h", "ET_scenario_mm_h"]
-        zone_cols = ["ET_rem_mm_h"]
-        if tree_area > 0:
-            zone_cols.append("ET_tree_mm_h")
-        if grass_area > 0:
-            zone_cols.append("ET_grass_mm_h")
-        if water_area > 0:
-            zone_cols.append("ET_water_mm_h")
-        if hard_area > 0:
-            zone_cols.append("ET_hard_mm_h")
+        st.subheader("Time Series Analysis")
 
-        st.subheader("Hourly ET: Reference, existing baseline, and scenario")
-        st.line_chart(df.set_index("timestamp")[ref_site_cols])
+        st.markdown("Select what to display:")
+        show_baseline = st.checkbox("Baseline", value=True)
+        show_proposed = st.checkbox("Proposed", value=True)
 
-        st.subheader("Hourly ET: Site breakdown")
-        st.line_chart(df.set_index("timestamp")[zone_cols])
+        # Build datasets
+        ts_df = df_period.set_index("timestamp")
 
-        daily_ref_site = df.set_index("timestamp")[ref_site_cols].resample("D").sum()
-        st.subheader("Daily ET totals: Reference, existing baseline, and scenario")
-        st.line_chart(daily_ref_site)
+        # ET
+        st.markdown("### Evapotranspiration (ET)")
+        et_cols = []
+        if show_baseline:
+            et_cols.append("ET_existing_mm_h")
+        if show_proposed:
+            et_cols.append("ET_scenario_mm_h")
+        if et_cols:
+            st.line_chart(ts_df[et_cols])
 
-        daily_zones = df.set_index("timestamp")[zone_cols].resample("D").sum()
-        st.subheader("Daily ET totals: Site breakdown")
-        st.line_chart(daily_zones)
+        # Water volume
+        st.markdown("### Water Volume")
+        vol_cols = []
+        if show_baseline:
+            vol_cols.append("Existing_ET_m3_h")
+        if show_proposed:
+            vol_cols.append("Total_Weighted_ET_m3_h")
+        if vol_cols:
+            st.line_chart(ts_df[vol_cols])
 
-        monthly_ref_site = df.set_index("timestamp")[ref_site_cols].resample("ME").sum()
-        st.subheader("Monthly ET totals: Reference, existing baseline, and scenario")
-        st.line_chart(monthly_ref_site)
+        # Cooling
+        st.markdown("### Cooling")
+        cool_cols = []
+        if show_baseline:
+            cool_cols.append("Existing_Cooling_kWh_h")
+        if show_proposed:
+            cool_cols.append("Scenario_Cooling_kWh_h")
+        if cool_cols:
+            st.line_chart(ts_df[cool_cols])
 
-        monthly_zones = df.set_index("timestamp")[zone_cols].resample("ME").sum()
-        st.subheader("Monthly ET totals: Site breakdown")
-        st.line_chart(monthly_zones)
-
-        annual_ref_site = df.set_index("timestamp")[ref_site_cols].resample("YE").sum()
-        annual_zones = df.set_index("timestamp")[zone_cols].resample("YE").sum()
-        st.subheader("Annual ET totals")
-        annual_label = str(annual_ref_site.index[-1].year) if len(annual_ref_site.index) > 0 else "Year"
-        et0_total = annual_ref_site["ET0_mm_h"].iloc[-1] if "ET0_mm_h" in annual_ref_site.columns else 0.0
-        et_site_total = annual_ref_site["ET_existing_mm_h"].iloc[-1] if "ET_existing_mm_h" in annual_ref_site.columns else 0.0
-
-        zone_order = ["ET_tree_mm_h", "ET_grass_mm_h", "ET_water_mm_h", "ET_hard_mm_h", "ET_rem_mm_h"]
-        zone_name_map = {
-            "ET_tree_mm_h": "Trees",
-            "ET_grass_mm_h": "Grass / planting",
-            "ET_water_mm_h": "Water",
-            "ET_hard_mm_h": "Hardscape",
-            "ET_rem_mm_h": "Remainder",
-        }
-
-        if PLOTLY_AVAILABLE:
-            annual_fig = go.Figure()
-            annual_fig.add_trace(go.Bar(name="ET0", x=["ET0"], y=[et0_total]))
-            annual_fig.add_trace(go.Bar(name="Existing baseline", x=["Existing baseline"], y=[et_site_total]))
-            for col in zone_order:
-                if col in annual_zones.columns:
-                    annual_fig.add_trace(go.Bar(name=zone_name_map[col], x=["Zone breakdown"], y=[annual_zones[col].iloc[-1]]))
-            annual_fig.update_layout(
-                barmode="stack",
-                xaxis=dict(title=annual_label),
-                yaxis=dict(title="Annual ET (mm)"),
-                bargap=0.55,
-                margin=dict(l=40, r=20, t=20, b=40),
-                height=430,
-                legend_title_text="Series"
-            )
-            st.plotly_chart(annual_fig, use_container_width=True)
-        else:
-            zone_total = annual_zones.sum(axis=1).iloc[-1] if len(annual_zones) > 0 else 0.0
-            simple_df = pd.DataFrame({"Annual ET (mm)": [et0_total, et_site_total, zone_total]}, index=["ET0", "Existing baseline", "Zone breakdown"])
-            st.bar_chart(simple_df)
+        st.caption("All charts reflect the selected analysis period.")
 
     with tab3:
-        vol_cols = ["Existing_ET_m3_h", "Total_Weighted_ET_m3_h", "Existing_Cooling_kWh_h", "Total_Weighted_Cooling_kWh_h", "Rem_ET_m3_h", "Rem_Cooling_kWh_h"]
-        if tree_area > 0:
-            vol_cols += ["Tree_ET_m3_h", "Tree_Cooling_kWh_h"]
-        if grass_area > 0:
-            vol_cols += ["Grass_ET_m3_h", "Grass_Cooling_kWh_h"]
-        if water_area > 0:
-            vol_cols += ["Water_ET_m3_h", "Water_Cooling_kWh_h"]
-        if hard_area > 0:
-            vol_cols += ["Hard_ET_m3_h", "Hard_Cooling_kWh_h"]
-        if "Net_Benchmark_kWh_m2_h" in df.columns:
-            vol_cols += ["Net_Benchmark_kWh_m2_h"]
+        st.markdown("### Download results")
+        st.caption("Download the hourly ET, water volume, cooling, and benchmark results for the selected model run.")
 
-        st.subheader("Hourly water volume and latent cooling equivalent")
-        st.line_chart(df.set_index("timestamp")[vol_cols])
-
-        daily_vol = df.set_index("timestamp")[vol_cols].resample("D").sum()
-        st.subheader("Daily water volume and latent cooling equivalent")
-        st.line_chart(daily_vol)
-
-        monthly_vol = df.set_index("timestamp")[vol_cols].resample("ME").sum()
-        st.subheader("Monthly water volume and latent cooling equivalent")
-        st.line_chart(monthly_vol)
-
-        annual_vol = df.set_index("timestamp")[vol_cols].resample("YE").sum()
-        st.subheader("Annual water volume and latent cooling equivalent")
-        st.bar_chart(annual_vol)
-
-    with tab4:
         export_cols = [
             "timestamp", "ET0_mm_h", "ET_existing_mm_h", "ET_scenario_mm_h", "ET_rem_mm_h", "ET_tree_mm_h", "ET_grass_mm_h", "ET_water_mm_h", "ET_hard_mm_h",
             "Existing_ET_m3_h", "Tree_ET_m3_h", "Grass_ET_m3_h", "Water_ET_m3_h", "Hard_ET_m3_h", "Rem_ET_m3_h", "Total_Weighted_ET_m3_h",
             "Existing_Cooling_kWh_h", "Tree_Cooling_kWh_h", "Grass_Cooling_kWh_h", "Water_Cooling_kWh_h", "Hard_Cooling_kWh_h", "Rem_Cooling_kWh_h", "Total_Weighted_Cooling_kWh_h",
-            "Net_Benchmark_kWh_m2_h"
+            "Cooling_kWh_m2_h"
         ]
         export_cols = [c for c in export_cols if c in df.columns]
         csv_data = df[export_cols].to_csv(index=False).encode("utf-8")
         st.download_button("Download results CSV", data=csv_data, file_name="site_et_results.csv", mime="text/csv")
+
+        st.markdown("### Print / export view")
+        st.caption("Use your browser print command to save the current dashboard as a PDF. Collapse technical details first for a cleaner report.")
+        if st.button("Prepare print view"):
+            st.info("Print view is ready. Use Ctrl+P or your browser menu to save as PDF.")
+
