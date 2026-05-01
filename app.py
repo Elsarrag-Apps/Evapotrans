@@ -993,10 +993,28 @@ if results is not None:
                 )
                 chart_col.altair_chart(pie, use_container_width=True)
 
-            display_comp_df = composition_df[["Scenario", "Surface type", "Area (m2)", "Percent"]].copy()
-            display_comp_df["Area (m2)"] = display_comp_df["Area (m2)"].map(lambda x: f"{x:,.0f}")
-            display_comp_df["Percent"] = display_comp_df["Percent"].map(lambda x: f"{x:.1f}%")
-            st.dataframe(display_comp_df, use_container_width=True, hide_index=True)
+            # Reshape to compact comparison table
+            pivot_df = composition_df.pivot_table(index="Surface type", columns="Scenario", values=["Area (m2)", "Percent"], aggfunc="sum").fillna(0)
+            pivot_df.columns = [f"{col[1]} {col[0]}" for col in pivot_df.columns]
+            pivot_df = pivot_df.reset_index()
+
+            # Rename for clarity
+            pivot_df = pivot_df.rename(columns={
+                "Baseline Area (m2)": "Baseline Area",
+                "Baseline Percent": "Baseline %",
+                "Proposed Area (m2)": "Proposed Area",
+                "Proposed Percent": "Proposed %",
+            })
+
+            # Format values
+            for col in ["Baseline Area", "Proposed Area"]:
+                if col in pivot_df.columns:
+                    pivot_df[col] = pivot_df[col].map(lambda x: f"{x:,.0f}")
+            for col in ["Baseline %", "Proposed %"]:
+                if col in pivot_df.columns:
+                    pivot_df[col] = pivot_df[col].map(lambda x: f"{x:.1f}%")
+
+            st.dataframe(pivot_df, use_container_width=True, hide_index=True)
         elif PLOTLY_AVAILABLE and not composition_df.empty:
             c1, c2 = st.columns(2)
             for scenario_name, chart_col in [("Baseline", c1), ("Proposed", c2)]:
@@ -1123,6 +1141,4 @@ if results is not None:
         st.caption("Use your browser print command to save the current dashboard as a PDF. Collapse technical details first for a cleaner report.")
         if st.button("Prepare print view"):
             st.info("Print view is ready. Use Ctrl+P or your browser menu to save as PDF.")
-
-
 
