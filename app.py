@@ -991,21 +991,12 @@ if results is not None:
                     )
                     .properties(title=scenario_name, height=300)
                 )
-                labels = (
-                    alt.Chart(scenario_df)
-                    .mark_text(radius=132, fontSize=12, fontWeight="bold")
-                    .encode(
-                        theta=alt.Theta("Area (m2):Q"),
-                        text="Label:N",
-                    )
-                )
-                chart_col.altair_chart(pie + labels, use_container_width=True)
+                chart_col.altair_chart(pie, use_container_width=True)
 
-            st.dataframe(
-                composition_df[["Scenario", "Surface type", "Area (m2)", "Percent"]].style.format({"Area (m2)": "{:,.0f}", "Percent": "{:.1f}%"}),
-                use_container_width=True,
-                hide_index=True,
-            )
+            display_comp_df = composition_df[["Scenario", "Surface type", "Area (m2)", "Percent"]].copy()
+            display_comp_df["Area (m2)"] = display_comp_df["Area (m2)"].map(lambda x: f"{x:,.0f}")
+            display_comp_df["Percent"] = display_comp_df["Percent"].map(lambda x: f"{x:.1f}%")
+            st.dataframe(display_comp_df, use_container_width=True, hide_index=True)
         elif PLOTLY_AVAILABLE and not composition_df.empty:
             c1, c2 = st.columns(2)
             for scenario_name, chart_col in [("Baseline", c1), ("Proposed", c2)]:
@@ -1014,7 +1005,7 @@ if results is not None:
                     labels=scenario_df["Surface type"],
                     values=scenario_df["Area (m2)"],
                     hole=0.35,
-                    textinfo="label+value+percent",
+                    textinfo="none",
                     textfont_size=14,
                     marker=dict(colors=["#2E7D32", "#7CB342", "#039BE5", "#9E9E9E"]),
                     hovertemplate="%{label}<br>%{value:,.0f} m2<br>%{percent}<extra></extra>",
@@ -1068,7 +1059,9 @@ if results is not None:
                 "Rain-fed ET model enabled": 1.0 if results.get("use_rain_fed_model") else 0.0,
                 "Maximum rainfall storage (mm)": results.get("max_soil_storage_mm", np.nan),
             }
-            st.dataframe(pd.DataFrame(summary.items(), columns=["Metric", "Value"]).style.format({"Value": "{:.2f}"}), use_container_width=True)
+            summary_df = pd.DataFrame(summary.items(), columns=["Metric", "Value"])
+            summary_df["Value"] = summary_df["Value"].apply(lambda x: f"{x:,.2f}" if isinstance(x, (int, float, np.integer, np.floating)) and pd.notna(x) else str(x))
+            st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
     with tab2:
         st.subheader("Time Series Analysis")
@@ -1130,4 +1123,6 @@ if results is not None:
         st.caption("Use your browser print command to save the current dashboard as a PDF. Collapse technical details first for a cleaner report.")
         if st.button("Prepare print view"):
             st.info("Print view is ready. Use Ctrl+P or your browser menu to save as PDF.")
+
+
 
